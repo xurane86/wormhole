@@ -1,0 +1,26 @@
+services:
+  relay-server:
+    build: .
+    container_name: wormhole
+    restart: unless-stopped
+    ports:
+      - "7800:7800"
+    environment:
+      # Shared secret between server and agents (REQUIRED, use a strong random value)
+      - RELAY_SECRET=change-me-to-a-strong-random-secret
+      # Optional: enable subdomain mode, e.g. {rule}.example.com
+      # - (pass via command below, see --root-domain)
+      # Optional: admin UI basic auth
+      # - ADMIN_USER=admin
+      # - ADMIN_PASS=strong-password
+    command: >
+      node index.js
+      --port 7800
+      --data /data
+      --admin-user admin
+      --admin-pass admin-pass-here
+    volumes:
+      - relay-data:/data
+
+volumes:
+  relay-data:

@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>wormhole :: server console</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div class="wrap">
+
+  <div class="hdr">
+    <div class="brand">
+      <span class="logo">wormhole</span>
+      <span class="tag">server console</span>
+      <span class="spacer"></span>
+      <span class="muted" id="modeHint"></span>
+    </div>
+    <div class="meta">
+      <span class="k">entry:</span> <span id="modeHint2"></span>
+      &nbsp;·&nbsp; <span class="k">rules:</span> <span id="summary">-</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-hd">routes</div>
+    <div class="card-bd">
+      <div class="row" style="margin-bottom:14px">
+        <button class="pri" id="btnNew">+ new rule</button>
+        <button id="btnRefresh">refresh</button>
+        <span class="spacer"></span>
+        <span class="muted">auto-refresh 10s</span>
+      </div>
+      <table>
+        <thead><tr>
+          <th>name</th><th>state</th><th>agent</th><th>entry</th><th>traffic</th><th style="width:290px">ops</th>
+        </tr></thead>
+        <tbody id="rows"><tr><td colspan="6" class="muted">loading...</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-hd">usage</div>
+    <div class="card-bd hint">
+      1. start an agent on an intranet machine: <code>node agent/index.js</code> (UI at <code>:7810</code>) or CLI with <code>--token</code><br>
+      2. click <b>Agent 接入</b> on a rule to get its token / one-line command<br>
+      3. external users access the intranet site via the entry URL above
+    </div>
+  </div>
+
+</div>
+
+<dialog id="dlg">
+  <h3 id="dlgTitle">new rule</h3>
+  <div class="field">
+    <label>name (a-z 0-9 -)</label>
+    <input id="fName" placeholder="wiki" pattern="[a-zA-Z0-9][a-zA-Z0-9-]{1,62}">
+  </div>
+  <div class="field">
+    <label>description (optional)</label>
+    <input id="fDesc" placeholder="intranet wiki">
+  </div>
+  <div class="actions">
+    <button id="btnCancel">cancel</button>
+    <button class="pri" id="btnSave">save</button>
+  </div>
+</dialog>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const $ = s => document.querySelector(s);
+let rules = [];
+let ROOT = '';
+
+function toast(msg) {
+  const t = $('#toast');
+  t.textContent = msg; t.classList.add('show');
+  setTimeout(() => t.classList.remove('show'), 2200);
+}
+
+function fmtBytes(n) {
+  if (!n) return '0 B';
+  const u = ['B','KB','MB','GB']; let i = 0;
+  while (n >= 1024 && i < u.length-1) { n /= 1024; i++; }
+  return n.toFixed(i ? 1 : 0) + ' ' + u[i];
+}
+
+function entryURL(r) {
+  return ROOT ? `http://${r.name}.${ROOT}/` : `${location.origin}/p/${r.name}/`;
+}
+
+async function load() {
+  const res = await fetch('/api/rules');
+  const data = await res.json();
+  rules = data.rules;
+  ROOT = data.rootDomain || '';
+  const mode = ROOT
+    ? `subdomain: {rule}.${ROOT}`
+    : `path: ${location.origin}/p/{rule}/`;
+  $('#modeHint').textContent = mode;
+  $('#modeHint2').textContent = mode;
+  render();
+}
+
+function badge(parent, cls, text) {
+  const s = document.createElement('span');
+  s.className = 'badge ' + cls;
+  s.textContent = text;
+  parent.appendChild(s);
+}
+
+function render() {
+  const tbody = $('#rows');
+  tbody.textContent = '';
+  if (!rules.length) {
+    const tr = document.createElement('tr');
+    const td = document.createElement('td');
+    td.colSpan = 6;
+    td.className = 'muted';
+    td.textContent = '// no rules yet — create one with "+ new rule"';
+    tr.appendChild(td);
+    tbody.appendChild(tr);
+    $('#summary').textContent = '0 / 0 online';
+    return;
+  }
+  const online = rules.filter(r => r.online).length;
+  $('#summary').textContent = `${rules.length} total / ${online} online`;
+
+  for (const r of rules) {
+    const tr = document.createElement('tr');
+
+    const tdName = document.createElement('td');
+    const b = document.createElement('b');
+    b.textContent = r.name;
+    tdName.appendChild(b);
+    if (r.description) {
+      const d = document.createElement('div');
+      d.className = 'muted';
+      d.textContent = r.description;
+      tdName.appendChild(d);
+    }
+    tr.appendChild(tdName);
+
+    const tdEnabled = document.createElement('td');
+    badge(tdEnabled, r.enabled ? 'on' : 'off', r.enabled ? 'enabled' : 'disabled');
+    tr.appendChild(tdEnabled);
+
+    const tdOnline = document.createElement('td');
+    badge(tdOnline, r.online ? 'on' : 'off', r.online ? 'online' : 'offline');
+    tr.appendChild(tdOnline);
+
+    const tdEntry = document.createElement('td');
+    const a = document.createElement('a');
+    a.href = entryURL(r);
+    a.target = '_blank';
+    a.style.fontSize = '12px';
+    a.textContent = entryURL(r);
+    tdEntry.appendChild(a);
+    tr.appendChild(tdEntry);
+
+    const tdStat = document.createElement('td');
+    tdStat.className = 'stat';
+    tdStat.textContent = `${r.stats.requests} req / ${fmtBytes(r.stats.bytes)}`;
+    if (r.stats.lastRequestAt) {
+      tdStat.appendChild(document.createElement('br'));
+      tdStat.appendChild(document.createTextNode(new Date(r.stats.lastRequestAt).toLocaleString()));
+    }
+    tr.appendChild(tdStat);
+
+    const tdOps = document.createElement('td');
+    const mkBtn = (text, cls, fn) => {
+      const btn = document.createElement('button');
+      btn.textContent = text;
+      if (cls) btn.className = cls;
+      btn.style.marginRight = '6px';
+      btn.onclick = fn;
+      return btn;
+    };
+    tdOps.appendChild(mkBtn('Agent 接入', '', () => showAccess(r)));
+    tdOps.appendChild(mkBtn(r.enabled ? '停用' : '启用', '', () => toggle(r.name, !r.enabled)));
+    tdOps.appendChild(mkBtn('删除', 'danger', () => del(r.name)));
+    tr.appendChild(tdOps);
+
+    tbody.appendChild(tr);
+  }
+}
+
+function showAccess(r) {
+  if (!r.token) { toast('no token'); return; }
+  const cmd = `node agent/index.js --relay ${location.origin} --token ${r.token} --name ${r.name} --target http://intranet-target:port`;
+  const dlg = document.createElement('dialog');
+  const h = document.createElement('h3');
+  h.textContent = `agent access :: ${r.name}`;
+  dlg.appendChild(h);
+
+  const p1 = document.createElement('p');
+  p1.className = 'muted';
+  p1.textContent = '方式一：Agent 控制台（推荐）';
+  dlg.appendChild(p1);
+  const pre0 = document.createElement('pre');
+  pre0.textContent = 'run on intranet:   node agent/index.js\nopen console:      http://127.0.0.1:7810\nauth mode:         rule token -> paste below';
+  dlg.appendChild(pre0);
+
+  const p2 = document.createElement('p');
+  p2.className = 'muted';
+  p2.textContent = 'rule token';
+  dlg.appendChild(p2);
+  const pre1 = document.createElement('pre');
+  pre1.textContent = r.token;
+  dlg.appendChild(pre1);
+
+  const p3 = document.createElement('p');
+  p3.className = 'muted';
+  p3.textContent = '方式二：CLI one-liner';
+  dlg.appendChild(p3);
+  const pre2 = document.createElement('pre');
+  pre2.textContent = cmd;
+  dlg.appendChild(pre2);
+
+  const actions = document.createElement('div');
+  actions.className = 'actions';
+  const btnCopy = document.createElement('button');
+  btnCopy.className = 'pri';
+  btnCopy.textContent = 'copy cmd';
+  btnCopy.onclick = () => { navigator.clipboard.writeText(cmd); toast('copied'); };
+  actions.appendChild(btnCopy);
+  const btnClose = document.createElement('button');
+  btnClose.textContent = 'close';
+  btnClose.onclick = () => dlg.close();
+  actions.appendChild(btnClose);
+  dlg.appendChild(actions);
+
+  document.body.appendChild(dlg);
+  dlg.showModal();
+  dlg.addEventListener('close', () => dlg.remove());
+}
+
+async function toggle(name, enabled) {
+  await fetch('/api/rules/' + name, { method: 'PATCH', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ enabled }) });
+  toast(enabled ? 'enabled' : 'disabled');
+  load();
+}
+
+async function del(name) {
+  if (!confirm(`delete rule "${name}"?`)) return;
+  await fetch('/api/rules/' + name, { method: 'DELETE' });
+  toast('deleted');
+  load();
+}
+
+$('#btnNew').onclick = () => { $('#dlgTitle').textContent = 'new rule'; $('#fName').value = ''; $('#fDesc').value = ''; $('#dlg').showModal(); };
+$('#btnCancel').onclick = () => $('#dlg').close();
+$('#btnRefresh').onclick = load;
+$('#btnSave').onclick = async () => {
+  const name = $('#fName').value.trim();
+  const description = $('#fDesc').value.trim();
+  if (!name) return toast('name required');
+  const res = await fetch('/api/rules', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ name, description }) });
+  if (res.ok) { $('#dlg').close(); toast('created'); load(); }
+  else { const e = await res.json(); toast(e.error || 'failed'); }
+};
+
+load();
+setInterval(load, 10000);
+</script>
+</body>
+</html>

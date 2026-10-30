@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>wormhole :: agent console</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div class="wrap">
+
+  <div class="hdr">
+    <div class="brand">
+      <span class="logo">wormhole</span>
+      <span class="tag">agent console</span>
+      <span class="spacer"></span>
+      <span class="badge" id="stateBadge">init</span>
+    </div>
+    <div class="meta">
+      <span class="k">tunnel:</span> <span id="stateText">-</span>
+      <span id="stateDetail"></span>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-hd">tunnel control</div>
+    <div class="card-bd">
+      <div class="row">
+        <button class="pri" id="btnStart">connect</button>
+        <button class="danger" id="btnStop">disconnect</button>
+        <button id="btnTest">test target</button>
+        <span class="spacer"></span>
+        <span class="test-result" id="testResult"></span>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-hd">configuration</div>
+    <div class="card-bd">
+      <div class="field">
+        <label>relay server url</label>
+        <input id="fRelay" placeholder="http://relay.example.com:7800">
+      </div>
+      <div class="row">
+        <div class="field" style="flex:1">
+          <label>rule name (same as server rule)</label>
+          <input id="fName" placeholder="wiki">
+        </div>
+        <div class="field" style="max-width:190px">
+          <label>auth mode</label>
+          <select id="fAuthMode">
+            <option value="secret">shared secret</option>
+            <option value="token">rule token</option>
+          </select>
+        </div>
+      </div>
+      <div class="field" id="fieldSecret">
+        <label>shared secret (server --secret)</label>
+        <input id="fSecret" type="password" placeholder="shared secret">
+      </div>
+      <div class="field" id="fieldToken" style="display:none">
+        <label>rule token (copy from server /admin)</label>
+        <input id="fToken" type="password" placeholder="paste rule token here">
+      </div>
+      <div class="field">
+        <label>intranet target</label>
+        <input id="fTarget" placeholder="http://192.168.1.10:8090">
+      </div>
+      <div class="field">
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;color:var(--txt)">
+          <input type="checkbox" id="fAutoStart" style="width:auto"> auto-connect on startup
+        </label>
+      </div>
+      <div class="actions" style="display:flex;gap:10px;margin-top:6px">
+        <button class="pri" id="btnSave">save &amp; connect</button>
+      </div>
+      <div class="hint" style="margin-top:14px">
+        config is persisted to <code>agent-config.json</code>.<br>
+        after connect, the intranet target is reachable at <code>http://relay:7800/p/&lt;rule&gt;/</code>.
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const $ = s => document.querySelector(s);
+const stateNames = { stopped: 'stopped', connecting: 'connecting', connected: 'connected' };
+const badgeClass  = { stopped: 'off', connecting: 'warn', connected: 'on' };
+
+function toast(msg) {
+  const t = $('#toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  setTimeout(() => t.classList.remove('show'), 2400);
+}
+
+function fillForm(cfg) {
+  $('#fRelay').value = cfg.relay || '';
+  $('#fName').value = cfg.name || '';
+  $('#fAuthMode').value = cfg.authMode || 'secret';
+  $('#fSecret').value = cfg.secret || '';
+  $('#fToken').value = cfg.token || '';
+  $('#fTarget').value = cfg.target || '';
+  $('#fAutoStart').checked = cfg.autoStart !== false;
+  toggleAuthFields();
+}
+
+function toggleAuthFields() {
+  const mode = $('#fAuthMode').value;
+  $('#fieldSecret').style.display = mode === 'secret' ? '' : 'none';
+  $('#fieldToken').style.display = mode === 'token' ? '' : 'none';
+}
+
+function collectForm() {
+  return {
+    relay: $('#fRelay').value.trim(),
+    name: $('#fName').value.trim(),
+    authMode: $('#fAuthMode').value,
+    secret: $('#fSecret').value,
+    token: $('#fToken').value.trim(),
+    target: $('#fTarget').value.trim(),
+    autoStart: $('#fAutoStart').checked,
+  };
+}
+
+async function refreshStatus() {
+  try {
+    const s = await (await fetch('/api/status')).json();
+    const dot = document.querySelector('.dot');
+    // header badge
+    const badge = $('#stateBadge');
+    badge.className = 'badge ' + (badgeClass[s.state] || 'off');
+    badge.textContent = stateNames[s.state] || s.state;
+    let detail = '';
+    if (s.connectedAt) detail += '  since ' + new Date(s.connectedAt).toLocaleString();
+    if (s.lastError) detail += '  err: ' + s.lastError;
+    $('#stateText').textContent = stateNames[s.state] || s.state;
+    $('#stateDetail').textContent = detail;
+    $('#btnStart').disabled = s.state === 'connected';
+    $('#btnStop').disabled = s.state === 'stopped';
+  } catch { /* transient */ }
+}
+
+async function load() {
+  const d = await (await fetch('/api/config')).json();
+  fillForm(d.config);
+  refreshStatus();
+}
+
+$('#fAuthMode').onchange = toggleAuthFields;
+
+$('#btnSave').onclick = async () => {
+  const res = await fetch('/api/config', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(collectForm()),
+  });
+  const d = await res.json();
+  if (!res.ok) return toast(d.error || 'save failed');
+  toast(d.restarted ? 'saved & reconnected' : 'saved');
+  refreshStatus();
+};
+
+$('#btnStart').onclick = async () => {
+  const res = await fetch('/api/tunnel', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'start' }) });
+  const d = await res.json();
+  if (!res.ok) return toast(d.error || 'start failed');
+  toast('connecting...');
+  setTimeout(refreshStatus, 500);
+};
+
+$('#btnStop').onclick = async () => {
+  await fetch('/api/tunnel', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'stop' }) });
+  toast('disconnected');
+  refreshStatus();
+};
+
+$('#btnTest').onclick = async () => {
+  const el = $('#testResult');
+  el.className = 'test-result muted';
+  el.textContent = 'testing...';
+  const res = await fetch('/api/test-target', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ target: $('#fTarget').value.trim() }),
+  });
+  const d = await res.json();
+  el.className = 'test-result ' + (d.ok ? 'ok' : 'bad');
+  el.style.color = d.ok ? 'var(--ok)' : 'var(--off)';
+  el.textContent = d.ok ? '[ok] ' + d.message : '[fail] ' + d.message;
+};
+
+load();
+setInterval(refreshStatus, 3000);
+</script>
+</body>
+</html>

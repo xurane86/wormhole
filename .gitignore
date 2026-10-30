@@ -1,0 +1,5 @@
+node_modules/
+*-data/
+*.log
+shots/
+agent/agent-config.json

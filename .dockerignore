@@ -1,0 +1,7 @@
+node_modules/
+agent/agent-config.json
+demo-data/
+test-data/
+relay-data/
+shots/
+*.log
