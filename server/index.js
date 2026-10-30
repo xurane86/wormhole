@@ -7,6 +7,12 @@ import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
 import { RuleStore } from './store.js';
 import { AgentHub } from './hub.js';
+import {
+  rewriteHtmlStream,
+  rewriteCssStream,
+  rewriteResponseHeaders,
+  canRewriteText,
+} from './rewrite.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -97,7 +103,8 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (ruleName) {
-    return handleForward(req, res, ruleName, innerPath + url.search);
+    // m 命中 = 路径模式（/p/{name}/...）；子域名模式在根路径上，不需要改写
+    return handleForward(req, res, ruleName, innerPath + url.search, Boolean(m));
   }
 
   // 根路径 → 简介页
@@ -192,7 +199,7 @@ function readBody(req, limit = 64 * 1024 * 1024) {
 }
 
 // ---------- 转发 ----------
-async function handleForward(req, res, ruleName, innerPath) {
+async function handleForward(req, res, ruleName, innerPath, pathMode = true) {
   const rule = store.get(ruleName);
   if (!rule) {
     res.writeHead(404, { 'Content-Type': 'text/html; charset=utf-8' });
@@ -232,23 +239,26 @@ async function handleForward(req, res, ruleName, innerPath) {
   try {
     const head = await fwd.response;
 
-    const outHeaders = { ...head.headers };
-    delete outHeaders['transfer-encoding'];
-    delete outHeaders['content-length'];
-
-    // HTML 改写：把指向内网根路径的绝对 URL 改写到 /p/{name}/ 前缀下
-    const contentType = outHeaders['content-type'] || '';
-    const needRewrite = /text\/html/i.test(contentType);
+    // 路径模式：Location / Set-Cookie 的 Path / HTML 绝对路径 / CSS url() 全部改写；
+    // 子域名模式：只去 hop-by-hop / content-length，body 与 header 原样。
+    // 注意：目标应用自身 JS 发起的绝对路径请求（如 fetch("/api/x")）无法在 relay 层改写，
+    // SPA 需应用侧配置 basePath（如 Next.js 的 basePath: '/p/{name}'）才能在路径模式完全可用。
     const prefix = `/p/${ruleName}`;
-    const rewrite = (buf) => {
-      let html = buf.toString('utf8');
-      html = html.replace(/(\s(?:href|src|action)\s*=\s*["'])\//gi, `$1${prefix}/`);
-      return Buffer.from(html);
-    };
-
+    const outHeaders = rewriteResponseHeaders(head.headers, {
+      prefix,
+      targetOrigin: head.targetOrigin,
+      pathMode,
+    });
+    const contentType = String(outHeaders['content-type'] || '');
+    const needHtmlRewrite = pathMode && /text\/html/i.test(contentType) && canRewriteText(contentType);
+    const needCssRewrite = pathMode && /text\/css/i.test(contentType) && canRewriteText(contentType);
     res.writeHead(head.status, outHeaders);
-    for await (const chunk of head.body) {
-      res.write(needRewrite ? rewrite(chunk) : chunk);
+    if (needHtmlRewrite) {
+      for await (const chunk of rewriteHtmlStream(head.body, prefix, head.targetOrigin)) res.write(chunk);
+    } else if (needCssRewrite) {
+      for await (const chunk of rewriteCssStream(head.body, prefix, head.targetOrigin)) res.write(chunk);
+    } else {
+      for await (const chunk of head.body) res.write(chunk);
     }
     res.end();
     store.bumpStats(ruleName, fwd.stats.bytesIn, fwd.stats.bytesOut);
