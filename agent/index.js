@@ -318,11 +318,30 @@ function handleWsOpen(rule, t, frame, msg) {
   });
   req.on('upgrade', (res, socket, head) => {
     send(t, T.WS_OPEN_OK, id, { protocol: res.headers['sec-websocket-protocol'] || '' });
+    // socket 是升级后的底层传输；两个方向都需按 RFC6455 封帧/解帧（见 encodeWsFrame / createWsFrameDecoder）
+    t.wsTunnels.set(id, socket);
     if (head?.length) send(t, T.WS_DATA, id, Buffer.concat([Buffer.from([1]), head]));
-    socket.on('data', (c) => send(t, T.WS_DATA, id, Buffer.concat([Buffer.from([1]), c])));
+    const decode = createWsFrameDecoder((payload, opcode) => {
+      if (opcode === 0x8) {
+        // 从 close 帧提取真实 code/reason 回传 relay（RFC6455：前2字节 code，余下 reason）
+        let code = 1000, reason = '';
+        if (payload.length >= 2) {
+          code = payload.readUInt16BE(0);
+          reason = payload.subarray(2).toString();
+        }
+        send(t, T.WS_CLOSE, id, { code, reason });
+        socket.end();
+        t.wsTunnels.delete(id);
+        return;
+      }
+      if (opcode === 0x9 || opcode === 0xA) return; // ping/pong 忽略
+      if (opcode === 0x1 || opcode === 0x2) {
+        send(t, T.WS_DATA, id, Buffer.concat([Buffer.from([opcode === 0x2 ? 1 : 0]), payload]));
+      }
+    });
+    socket.on('data', (c) => decode(c));
     socket.on('close', () => send(t, T.WS_CLOSE, id, { code: 1000, reason: '' }));
     socket.on('error', () => send(t, T.WS_CLOSE, id, { code: 1011, reason: 'target socket error' }));
-    t.wsTunnels.set(id, socket);
   });
   req.on('response', (res) => {
     send(t, T.WS_OPEN_ERR, id, { message: `目标未升级为 WebSocket (HTTP ${res.statusCode})` });
@@ -333,13 +352,88 @@ function handleWsOpen(rule, t, frame, msg) {
   req.end();
 }
 
+// RFC6455 客户端帧封装（必须掩码）。opcode: 0x1 文本 / 0x2 binary / 0x8 close
+// RFC6455 帧流解析器（服务端视角：帧不带掩码；支持分片/跨包）。回调 (payload, opcode)
+function createWsFrameDecoder(onFrame) {
+  let buf = Buffer.alloc(0);
+  return (chunk) => {
+    buf = buf.length ? Buffer.concat([buf, chunk]) : chunk;
+    for (;;) {
+      if (buf.length < 2) return;
+      const b0 = buf[0], b1 = buf[1];
+      const opcode = b0 & 0x0f;
+      const masked = (b1 & 0x80) !== 0;
+      let len = b1 & 0x7f, off = 2;
+      if (len === 126) {
+        if (buf.length < 4) return;
+        len = buf.readUInt16BE(2); off = 4;
+      } else if (len === 127) {
+        if (buf.length < 10) return;
+        len = Number(buf.readBigUInt64BE(2)); off = 10;
+      }
+      const mask = masked ? 4 : 0;
+      if (buf.length < off + mask + len) return;
+      let payload = buf.subarray(off + mask, off + mask + len);
+      if (masked) {
+        const mk = buf.subarray(off, off + 4);
+        payload = Buffer.from(payload);
+        for (let i = 0; i < payload.length; i++) payload[i] ^= mk[i & 3];
+      }
+      buf = buf.subarray(off + mask + len);
+      onFrame(payload, opcode);
+    }
+  };
+}
+
+function encodeWsFrame(data, opcode) {
+  const len = data.length;
+  let header;
+  let maskLen = 4;
+  if (len < 126) {
+    header = Buffer.allocUnsafe(2 + maskLen);
+    header[0] = 0x80 | opcode;
+    header[1] = 0x80 | len; // mask 位
+  } else if (len < 65536) {
+    header = Buffer.allocUnsafe(4 + maskLen);
+    header[0] = 0x80 | opcode;
+    header[1] = 0x80 | 126;
+    header.writeUInt16BE(len, 2);
+  } else {
+    header = Buffer.allocUnsafe(10 + maskLen);
+    header[0] = 0x80 | opcode;
+    header[1] = 0x80 | 127;
+    header.writeBigUInt64BE(BigInt(len), 2);
+  }
+  const maskOffset = header.length - maskLen;
+  const mask = crypto.randomBytes(maskLen);
+  mask.copy(header, maskOffset);
+  const body = Buffer.from(data);
+  for (let i = 0; i < body.length; i++) body[i] ^= mask[i & 3];
+  return Buffer.concat([header, body]);
+}
+
 function routeFrame(t, frame) {
   const handler = t.pendingBodyHandlers.get(frame.id);
   if (handler) return handler(frame.type, frame.payload);
   const tunnel = t.wsTunnels.get(frame.id);
   if (tunnel) {
-    if (frame.type === T.WS_DATA) tunnel.write(frame.payload.subarray(1));
-    else if (frame.type === T.WS_CLOSE) { tunnel.end(); t.wsTunnels.delete(frame.id); }
+    if (frame.type === T.WS_DATA) {
+      // tunnel 是升级后的底层 socket：裸写应用数据没有 WS 帧封装，对端会解析出非法帧。
+      // 服务端→客户端方向作为 client（无需掩码），按 RFC6455 手动封帧（文本/binary，不分片）。
+      const appData = frame.payload.subarray(1);
+      const isBinary = frame.payload[0] === 1;
+      tunnel.write(encodeWsFrame(appData, isBinary ? 0x2 : 0x1));
+    } else if (frame.type === T.WS_CLOSE) {
+      // 携带 close code/reason 封成 close 帧（JSON payload），让对端拿到真实关闭码
+      let code = 1000, reason = '';
+      try { const m = JSON.parse(frame.payload.toString() || '{}'); code = m.code || 1000; reason = m.reason || ''; } catch { }
+      const body = Buffer.alloc(2 + Buffer.byteLength(reason));
+      body.writeUInt16BE(code, 0);
+      body.write(reason, 2);
+      tunnel.write(encodeWsFrame(body, 0x8));
+      tunnel.end();
+      t.wsTunnels.delete(frame.id);
+    }
   }
 }
 

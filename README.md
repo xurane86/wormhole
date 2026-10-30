@@ -50,10 +50,23 @@ agent 会在转发时自动改写 HTML 里的绝对路径引用（`href="/..."`�
 
 `--host-mode`：设置 DNS 泛解析 `*.relay.你的域名.com` 指向 relay，访问 `{name}.relay.你的域名.com` 即直达内网站点，页面完全不需要路径前缀，兼容性最好。需在 relay 侧加 `--root-domain` 参数开启。
 
+### 兑底模式：`--default-rule`（可选，单应用部署才建议开启）
+
+```bash
+node server/index.js --port 7800 --secret ... --default-rule intranet-wiki
+# 或环境变量 RELAY_DEFAULT_RULE=intranet-wiki
+```
+
+开启后，所有既不是路径模式（`/p/{name}/...`）、也不是子域名模式的请求（含 WebSocket upgrade），都会把完整原始 path + query 转发到指定规则。适合「一台 relay 只服务一个内网应用」的部署，应用无需任何路径前缀即可完整可用。
+
+**安全提示：这本质是“单应用兑底”，一旦开启，任何扫到你域名的未匹配路径（如 `/wp-admin`、`/.env`）都会被转发进内网应用，仅建议在内网或带认证的前置层之后使用。**
+
+以下 relay 自身路由优先于兑底，不会被转发：`/`、`/admin`、`/admin/*`、`/style.css`、`/api/rules`、`/api/rules/*`、`/api/agent-token/*`、`/agent/ws`。指向的规则不存在时仅打启动警告，可在 `/admin` 中创建后自动生效。
+
 ## 支持的流量
 
 - 普通 HTTP/HTTPS 请求（GET/POST/PUT/DELETE/PATCH，含二进制与流式响应）
-- WebSocket 透传（如内网系统的实时功能）
+- WebSocket 透传：浏览器到内网目标的应用层 WebSocket 连接会在 relay 上自动桥接（含路径模式 `/p/{name}/ws/...`、子域名模式与下述 `--default-rule` 兑底模式）。文本/二进制帧原样透传，客户端请求的子协议由目标选中的协议回显；规则不存在返回 404、规则停用返回 502、agent 离线返回 503。注意：JS 发起的 `fetch("/api/...")` 等绝对路径请求在路径模式下仍无法由 relay 改写，SPA 类应用建议配置应用自身 basePath
 - 请求/响应头按需透传，自动处理 `Host`、`X-Forwarded-*`
 
 ## 管理页面

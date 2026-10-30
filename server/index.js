@@ -28,6 +28,8 @@ const DATA_DIR = arg('--data', './relay-data');
 const ROOT_DOMAIN = arg('--root-domain', ''); // 开启子域名模式，如 relay.example.com 的根 example.com
 const ADMIN_USER = arg('--admin-user', '');
 const ADMIN_PASS = arg('--admin-pass', '');
+// 单应用兑底：未匹配的根路径请求（含 WS）转发到该规则；可选，不设则 404
+const DEFAULT_RULE = arg('--default-rule', process.env.RELAY_DEFAULT_RULE || '');
 
 if (!SECRET) {
   console.error('缺少 --secret（server 与 agent 的共享密钥），或环境变量 RELAY_SECRET');
@@ -66,6 +68,16 @@ function sendJSON(res, code, obj) {
   res.end(body);
 }
 
+// 兑底模式下不能被抢走的 relay 自身路由
+function isReservedPath(pathName) {
+  return pathName === '/'
+    || pathName === '/admin' || pathName.startsWith('/admin/')
+    || pathName === '/style.css'
+    || pathName === '/api/rules' || pathName.startsWith('/api/rules/')
+    || pathName.startsWith('/api/agent-token/')
+    || pathName === '/agent/ws';
+}
+
 // ---------- HTTP 处理 ----------
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://x');
@@ -100,10 +112,14 @@ const server = http.createServer(async (req, res) => {
       ruleName = host.slice(0, -(ROOT_DOMAIN.length + 1));
       innerPath = pathName;
     }
+  } else if (DEFAULT_RULE && !isReservedPath(pathName)) {
+    // 兑底模式：完整原始 path + query 转发到默认规则（注意 reserved 路径已在前面的分支处理/拦截）
+    ruleName = DEFAULT_RULE;
+    innerPath = pathName;
   }
 
   if (ruleName) {
-    // m 命中 = 路径模式（/p/{name}/...）；子域名模式在根路径上，不需要改写
+    // m 命中 = 路径模式（/p/{name}/...）；子域名/兑底模式在根路径上，不需要改写
     return handleForward(req, res, ruleName, innerPath + url.search, Boolean(m));
   }
 
@@ -278,34 +294,146 @@ function noticePage(title, msg) {
 
 // ---------- Agent WebSocket 接入 ----------
 const wss = new WebSocketServer({ noServer: true });
+// 浏览器侧 WS 桥接专用实例（与 agent 的 wss 分开，避免 noServer 升级路径互相干扰）
+// 子协议回显：目标选中的协议通过 handleProtocols 写入 101 响应（ws.protocol 是只读 getter，不能直接赋值）
+let selectedProtocol = '';
+const wssBrowser = new WebSocketServer({
+  noServer: true,
+  handleProtocols: (protocols) => {
+    // 桥接模式下目标已选好协议；这里从客户端请求的列表里匹配目标选中的那个
+    for (const p of protocols) {
+      if (!selectedProtocol || p === selectedProtocol) return p;
+    }
+    return selectedProtocol || false;
+  },
+});
+
+// WS 规则解析：与 HTTP 路由同一套逻辑（路径模式 → 子域名模式 → 兑底）
+function resolveWsRule(req, url) {
+  const m = url.pathname.match(/^\/p\/([a-z0-9][a-z0-9-]{1,62})(\/.*)?$/i);
+  if (m) return { name: m[1], innerPath: (m[2] || '/') + url.search };
+  const host = (req.headers.host || '').split(':')[0].toLowerCase();
+  if (ROOT_DOMAIN
+    && host.toLowerCase() !== ROOT_DOMAIN.toLowerCase()
+    && host.endsWith('.' + ROOT_DOMAIN.toLowerCase())) {
+    return { name: host.slice(0, -(ROOT_DOMAIN.length + 1)), innerPath: url.pathname + url.search };
+  }
+  if (DEFAULT_RULE && !isReservedPath(url.pathname)) {
+    return { name: DEFAULT_RULE, innerPath: url.pathname + url.search };
+  }
+  return null;
+}
+
+function wsReject(socket, code, text) {
+  socket.write(`HTTP/1.1 ${code} ${text}\r\nConnection: close\r\n\r\n`);
+  socket.destroy();
+}
+
 server.on('upgrade', (req, socket, head) => {
   const url = new URL(req.url, 'http://x');
-  if (url.pathname !== '/agent/ws') { socket.destroy(); return; }
 
-  const name = url.searchParams.get('name') || '';
-  const token = url.searchParams.get('token') || '';
-  if (!store.authenticate(name, token, SECRET)) {
-    socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
-    socket.destroy();
-    return;
+  // agent 接入：保持原有行为不变
+  if (url.pathname === '/agent/ws') {
+    const name = url.searchParams.get('name') || '';
+    const token = url.searchParams.get('token') || '';
+    if (!store.authenticate(name, token, SECRET)) {
+      socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+    return wss.handleUpgrade(req, socket, head, (sock) => {
+      const conn = hub.register(name, sock);
+      console.log(`[agent] "${name}" 已连接 (${new Date().toISOString()})`);
+      sock.on('message', (data) => hub.onFrame(conn, data));
+      sock.on('close', () => {
+        hub.unregister(conn);
+        console.log(`[agent] "${name}" 已断开`);
+      });
+      sock.on('error', () => hub.unregister(conn));
+
+      // 心跳
+      const ping = setInterval(() => {
+        if (sock.readyState === 1) sock.ping();
+        else clearInterval(ping);
+      }, 30000);
+      sock.on('close', () => clearInterval(ping));
+    });
   }
 
-  wss.handleUpgrade(req, socket, head, (sock) => {
-    const conn = hub.register(name, sock);
-    console.log(`[agent] "${name}" 已连接 (${new Date().toISOString()})`);
-    sock.on('message', (data) => hub.onFrame(conn, data));
-    sock.on('close', () => {
-      hub.unregister(conn);
-      console.log(`[agent] "${name}" 已断开`);
-    });
-    sock.on('error', () => hub.unregister(conn));
+  // 浏览器侧 WS：桥接到内网目标
+  const resolved = resolveWsRule(req, url);
+  if (!resolved) return wsReject(socket, 404, 'Not Found');
+  const { name: ruleName, innerPath } = resolved;
 
-    // 心跳
-    const ping = setInterval(() => {
-      if (sock.readyState === 1) sock.ping();
-      else clearInterval(ping);
-    }, 30000);
-    sock.on('close', () => clearInterval(ping));
+  // 升级前先校验规则状态（避免先发 101 再失败）
+  const rule = store.get(ruleName);
+  if (!rule) return wsReject(socket, 404, 'Not Found');
+  if (!rule.enabled) return wsReject(socket, 502, 'Bad Gateway');
+  if (!hub.isOnline(ruleName)) return wsReject(socket, 503, 'Service Unavailable');
+
+  // 客户端请求的子协议
+  const protocols = String(req.headers['sec-websocket-protocol'] || '')
+    .split(',').map(s => s.trim()).filter(Boolean);
+
+  const tunnel = hub.openWebSocket(ruleName, {
+    url: innerPath,
+    headers: req.headers,
+    protocols,
+  });
+
+  // onData/onClose 在拿到 tunnel 后立刻赋值：目标可能抢先发数据，不能等 ready
+  let client = null;       // handleUpgrade 完成后的客户端 ws
+  let closed = false;      // 幂等清理标志
+  const cleanup = () => {
+    if (closed) return;
+    closed = true;
+    tunnel.onData = null;
+    tunnel.onClose = null;
+    if (client) {
+      client.removeAllListeners('message');
+      client.removeAllListeners('close');
+      client.removeAllListeners('error');
+    }
+  };
+  tunnel.onData = (data, isBinary) => {
+    if (client && client.readyState === 1) client.send(data, { binary: isBinary });
+  };
+  tunnel.onClose = ({ code, reason }) => {
+    cleanup();
+    if (client && client.readyState <= 1) client.close(code, reason);
+  };
+
+  // ready 加 10s 超时，超时按 504 处理
+  const readyTimeout = setTimeout(() => {
+    if (closed) return;
+    tunnel.close(1001, 'upstream ready timeout');
+    cleanup();
+    wsReject(socket, 504, 'Gateway Timeout');
+  }, 10000);
+
+  tunnel.ready.then(({ protocol }) => {
+    if (closed) return;
+    clearTimeout(readyTimeout);
+    selectedProtocol = protocol || '';
+    // 完成对客户端的 101 升级（子协议由 wssBrowser.handleProtocols 回显），再开始双向桥接
+    wssBrowser.handleUpgrade(req, socket, head, (ws) => {
+      if (closed) { try { ws.close(); } catch { } return; }
+      client = ws;
+      ws.on('message', (data, isBinary) => tunnel.send(data, isBinary));
+      ws.on('close', (code, reason) => {
+        cleanup();
+        tunnel.close(code, reason.toString().slice(0, 120));
+      });
+      ws.on('error', () => {
+        cleanup();
+        tunnel.close(1011, 'browser websocket error');
+      });
+    });
+  }).catch((e) => {
+    if (closed) return;
+    clearTimeout(readyTimeout);
+    cleanup();
+    wsReject(socket, e?.code === 'AGENT_TIMEOUT' ? 504 : 502, 'Bad Gateway');
   });
 });
 
@@ -317,4 +445,10 @@ server.listen(PORT, () => {
   console.log(`  管理页:  http://0.0.0.0:${PORT}/admin`);
   console.log(`  转发路径: /p/{规则名}/...`);
   if (ROOT_DOMAIN) console.log(`  子域名模式: {规则名}.${ROOT_DOMAIN}`);
+  if (DEFAULT_RULE) {
+    console.log(`  默认规则: ${DEFAULT_RULE}（未匹配的根路径请求将转发到该规则）`);
+    if (!store.get(DEFAULT_RULE)) {
+      console.warn(`  [警告] 默认规则 "${DEFAULT_RULE}" 当前不存在，可在 /admin 中创建后自动生效`);
+    }
+  }
 });
