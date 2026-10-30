@@ -26,6 +26,7 @@ const PORT = parseInt(arg('--port', '7800'), 10);
 const SECRET = arg('--secret', process.env.RELAY_SECRET || '');
 const DATA_DIR = arg('--data', './relay-data');
 const ROOT_DOMAIN = arg('--root-domain', ''); // 开启子域名模式，如 relay.example.com 的根 example.com
+const SELF_HOST = String(arg('--self-host', process.env.RELAY_SELF_HOST || '')).split(',')[0].trim().toLowerCase();
 const ADMIN_USER = arg('--admin-user', '');
 const ADMIN_PASS = arg('--admin-pass', '');
 // 单应用兑底：未匹配的根路径请求（含 WS）转发到该规则；可选，不设则 404
@@ -108,12 +109,18 @@ const server = http.createServer(async (req, res) => {
   } else if (ROOT_DOMAIN) {
     // 子域名模式: {name}.root
     const host = (req.headers.host || '').split(':')[0].toLowerCase();
-    if (host.toLowerCase() !== ROOT_DOMAIN.toLowerCase() && host.endsWith('.' + ROOT_DOMAIN.toLowerCase())) {
+    if (host !== SELF_HOST && host !== ROOT_DOMAIN && host.endsWith('.' + ROOT_DOMAIN)) {
       ruleName = host.slice(0, -(ROOT_DOMAIN.length + 1));
       innerPath = pathName;
     }
-  } else if (DEFAULT_RULE && !isReservedPath(pathName)) {
-    // 兑底模式：完整原始 path + query 转发到默认规则（注意 reserved 路径已在前面的分支处理/拦截）
+  }
+
+  // 兜底模式：既非路径模式也非子域名模式时，完整原始 path + query 转发到默认规则
+  // 必须独立判断：不能挂在上面 ROOT_DOMAIN 的 else 分支上，否则启用子域名模式后兜底永远不生效
+  // 根路径上的 Service Worker 绝不能经兜底转发：它的 scope 是整个 relay 域名，
+  // 会接管 /admin 和其它规则，并把旧壳子缓存住。子域名模式/路径模式下各自天然隔离，不受影响。
+  const rootServiceWorker = pathName === "/sw.js" || pathName === "/service-worker.js";
+  if (!ruleName && DEFAULT_RULE && !rootServiceWorker && !isReservedPath(pathName)) {
     ruleName = DEFAULT_RULE;
     innerPath = pathName;
   }
@@ -313,7 +320,7 @@ function resolveWsRule(req, url) {
   const m = url.pathname.match(/^\/p\/([a-z0-9][a-z0-9-]{1,62})(\/.*)?$/i);
   if (m) return { name: m[1], innerPath: (m[2] || '/') + url.search };
   const host = (req.headers.host || '').split(':')[0].toLowerCase();
-  if (ROOT_DOMAIN
+  if (ROOT_DOMAIN && host !== SELF_HOST
     && host.toLowerCase() !== ROOT_DOMAIN.toLowerCase()
     && host.endsWith('.' + ROOT_DOMAIN.toLowerCase())) {
     return { name: host.slice(0, -(ROOT_DOMAIN.length + 1)), innerPath: url.pathname + url.search };
@@ -325,6 +332,7 @@ function resolveWsRule(req, url) {
 }
 
 function wsReject(socket, code, text) {
+  if (socket.destroyed) return;
   socket.write(`HTTP/1.1 ${code} ${text}\r\nConnection: close\r\n\r\n`);
   socket.destroy();
 }
@@ -398,9 +406,16 @@ server.on('upgrade', (req, socket, head) => {
   tunnel.onData = (data, isBinary) => {
     if (client && client.readyState === 1) client.send(data, { binary: isBinary });
   };
-  tunnel.onClose = ({ code, reason }) => {
+  tunnel.onClose = (info) => {
+    const code = typeof info?.code == "number" ? info.code : 1011;
+    const reason = typeof info?.reason == "string" ? info.reason : (info?.message || "upstream closed");
     cleanup();
-    if (client && client.readyState <= 1) client.close(code, reason);
+    if (client) {
+      if (client.readyState <= 1) client.close(code, reason);
+      return;
+    }
+    // 尚未完成对浏览器的 101 升级：必须明确回错，否则浏览器一直挂着
+    wsReject(socket, 502, "Bad Gateway");
   };
 
   // ready 加 10s 超时，超时按 504 处理

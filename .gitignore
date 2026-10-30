@@ -3,3 +3,4 @@ node_modules/
 *.log
 shots/
 agent/agent-config.json
+.env

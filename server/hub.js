@@ -169,7 +169,8 @@ export class AgentHub {
     this.pending.delete(state.id);
     state.conn?.ids.delete(state.id);
     state.reject(err);
-    if (!state.body.destroyed) state.body.destroy(err);
+    // WS 隧道状态没有 body，这里必须判空，否则浏览器侧 WS 失败会直接崩掉 relay 进程
+    if (state.body && !state.body.destroyed) state.body.destroy(err);
     if (state.kind === 'ws') state.onClose?.(err);
   }
 
