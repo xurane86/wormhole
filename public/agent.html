@@ -17,8 +17,7 @@
       <span class="badge" id="stateBadge">init</span>
     </div>
     <div class="meta">
-      <span class="k">tunnel:</span> <span id="stateText">-</span>
-      <span id="stateDetail"></span>
+      <span class="k">tunnels:</span> <span id="stateText">-</span>
     </div>
   </div>
 
@@ -26,11 +25,8 @@
     <div class="card-hd">tunnel control</div>
     <div class="card-bd">
       <div class="row">
-        <button class="pri" id="btnStart">connect</button>
-        <button class="danger" id="btnStop">disconnect</button>
-        <button id="btnTest">test target</button>
-        <span class="spacer"></span>
-        <span class="test-result" id="testResult"></span>
+        <button class="pri" id="btnStart">connect all</button>
+        <button class="danger" id="btnStop">disconnect all</button>
       </div>
     </div>
   </div>
@@ -42,42 +38,22 @@
         <label>relay server url</label>
         <input id="fRelay" placeholder="http://relay.example.com:7800">
       </div>
-      <div class="row">
-        <div class="field" style="flex:1">
-          <label>rule name (same as server rule)</label>
-          <input id="fName" placeholder="wiki">
-        </div>
-        <div class="field" style="max-width:190px">
-          <label>auth mode</label>
-          <select id="fAuthMode">
-            <option value="secret">shared secret</option>
-            <option value="token">rule token</option>
-          </select>
-        </div>
-      </div>
-      <div class="field" id="fieldSecret">
-        <label>shared secret (server --secret)</label>
-        <input id="fSecret" type="password" placeholder="shared secret">
-      </div>
-      <div class="field" id="fieldToken" style="display:none">
-        <label>rule token (copy from server /admin)</label>
-        <input id="fToken" type="password" placeholder="paste rule token here">
-      </div>
-      <div class="field">
-        <label>intranet target</label>
-        <input id="fTarget" placeholder="http://192.168.1.10:8090">
-      </div>
       <div class="field">
         <label style="display:flex;align-items:center;gap:8px;cursor:pointer;color:var(--txt)">
           <input type="checkbox" id="fAutoStart" style="width:auto"> auto-connect on startup
         </label>
       </div>
+
+      <div id="rulesList" style="margin-top:10px"></div>
+
       <div class="actions" style="display:flex;gap:10px;margin-top:6px">
-        <button class="pri" id="btnSave">save &amp; connect</button>
+        <button id="btnAddRule">+ add rule</button>
+        <span class="spacer"></span>
+        <button class="pri" id="btnSave">save &amp; apply</button>
       </div>
       <div class="hint" style="margin-top:14px">
         config is persisted to <code>agent-config.json</code>.<br>
-        after connect, the intranet target is reachable at <code>http://relay:7800/p/&lt;rule&gt;/</code>.
+        each rule is reachable at <code>http://relay:7800/p/&lt;rule-name&gt;/</code> after connect.
       </div>
     </div>
   </div>
@@ -86,10 +62,56 @@
 
 <div class="toast" id="toast"></div>
 
+<template id="tplRule">
+  <div class="rule-item card" style="margin:10px 0;padding:12px">
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">
+      <span class="dot" data-dot></span>
+      <strong data-rname style="flex:1"></strong>
+      <span class="test-result" data-rstate></span>
+      <button data-act="start" style="padding:2px 10px">connect</button>
+      <button data-act="stop" class="danger" style="padding:2px 10px">stop</button>
+      <button data-act="del" class="danger" style="padding:2px 10px">remove</button>
+    </div>
+    <div class="row">
+      <div class="field" style="flex:1">
+        <label>rule name (same as server rule)</label>
+        <input data-f="name" placeholder="wiki">
+      </div>
+      <div class="field" style="max-width:170px">
+        <label>auth mode</label>
+        <select data-f="authMode">
+          <option value="secret">shared secret</option>
+          <option value="token">rule token</option>
+        </select>
+      </div>
+    </div>
+    <div class="field" data-secret>
+      <label>shared secret (server --secret)</label>
+      <input data-f="secret" type="password" placeholder="shared secret">
+    </div>
+    <div class="field" data-tokenfield style="display:none">
+      <label>rule token (copy from server /admin)</label>
+      <input data-f="token" type="password" placeholder="paste rule token here">
+    </div>
+    <div class="row">
+      <div class="field" style="flex:1">
+        <label>intranet target</label>
+        <input data-f="target" placeholder="http://192.168.1.10:8090">
+      </div>
+      <div style="align-self:flex-end;padding-bottom:14px">
+        <button data-act="test" style="padding:6px 12px">test</button>
+      </div>
+    </div>
+    <div class="test-result" data-test></div>
+  </div>
+</template>
+
 <script>
 const $ = s => document.querySelector(s);
 const stateNames = { stopped: 'stopped', connecting: 'connecting', connected: 'connected' };
 const badgeClass  = { stopped: 'off', connecting: 'warn', connected: 'on' };
+
+let rules = []; // working copy while editing
 
 function toast(msg) {
   const t = $('#toast');
@@ -98,101 +120,145 @@ function toast(msg) {
   setTimeout(() => t.classList.remove('show'), 2400);
 }
 
-function fillForm(cfg) {
-  $('#fRelay').value = cfg.relay || '';
-  $('#fName').value = cfg.name || '';
-  $('#fAuthMode').value = cfg.authMode || 'secret';
-  $('#fSecret').value = cfg.secret || '';
-  $('#fToken').value = cfg.token || '';
-  $('#fTarget').value = cfg.target || '';
-  $('#fAutoStart').checked = cfg.autoStart !== false;
-  toggleAuthFields();
+function toggleAuthFields(item) {
+  const mode = item.querySelector('[data-f="authMode"]').value;
+  item.querySelector('[data-secret]').style.display = mode === 'secret' ? '' : 'none';
+  item.querySelector('[data-tokenfield]').style.display = mode === 'token' ? '' : 'none';
 }
 
-function toggleAuthFields() {
-  const mode = $('#fAuthMode').value;
-  $('#fieldSecret').style.display = mode === 'secret' ? '' : 'none';
-  $('#fieldToken').style.display = mode === 'token' ? '' : 'none';
+function renderRules() {
+  const list = $('#rulesList');
+  list.innerHTML = '';
+  const tpl = $('#tplRule');
+  for (const r of rules) {
+    const node = tpl.content.firstElementChild.cloneNode(true);
+    node.querySelector('[data-f="name"]').value = r.name || '';
+    node.querySelector('[data-f="authMode"]').value = r.authMode || 'secret';
+    node.querySelector('[data-f="secret"]').value = r.secret || '';
+    node.querySelector('[data-f="token"]').value = r.token || '';
+    node.querySelector('[data-f="target"]').value = r.target || '';
+    toggleAuthFields(node);
+    node.addEventListener('input', () => { /* 编辑期间状态面板刷新不会覆盖（只读展示） */ });
+    node.querySelector('[data-f="authMode"]').onchange = () => toggleAuthFields(node);
+    node.addEventListener('click', async (e) => {
+      const act = e.target?.dataset?.act;
+      if (!act) return;
+      if (act === 'del') {
+        rules = rules.filter(x => x !== r);
+        renderRules();
+        return;
+      }
+      if (act === 'test') {
+        const el = node.querySelector('[data-test]');
+        el.className = 'test-result muted'; el.textContent = 'testing...';
+        const d = await (await fetch('/api/test-target', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ target: node.querySelector('[data-f="target"]').value.trim() }),
+        })).json();
+        el.className = 'test-result ' + (d.ok ? 'ok' : 'bad');
+        el.textContent = (d.ok ? '[ok] ' : '[fail] ') + d.message;
+        return;
+      }
+      // start/stop 需先保存当前编辑内容
+      const saved = await saveConfig(true);
+      if (!saved.ok) { toast(saved.error); return; }
+      const res = await fetch('/api/tunnel', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: act === 'start' ? 'start-rule' : 'stop-rule', name: node.querySelector('[data-f="name"]').value.trim() }),
+      });
+      const d = await res.json();
+      if (!res.ok) return toast(d.error || 'failed');
+      toast(act === 'start' ? 'connecting...' : 'stopped');
+      setTimeout(refreshStatus, 500);
+    });
+    list.appendChild(node);
+  }
 }
 
-function collectForm() {
-  return {
+function readRulesFromDom() {
+  return [...document.querySelectorAll('#rulesList .rule-item')].map(node => ({
+    name: node.querySelector('[data-f="name"]').value.trim(),
+    authMode: node.querySelector('[data-f="authMode"]').value,
+    secret: node.querySelector('[data-f="secret"]').value,
+    token: node.querySelector('[data-f="token"]').value.trim(),
+    target: node.querySelector('[data-f="target"]').value.trim(),
+  }));
+}
+
+async function saveConfig(silent = false) {
+  const body = {
     relay: $('#fRelay').value.trim(),
-    name: $('#fName').value.trim(),
-    authMode: $('#fAuthMode').value,
-    secret: $('#fSecret').value,
-    token: $('#fToken').value.trim(),
-    target: $('#fTarget').value.trim(),
     autoStart: $('#fAutoStart').checked,
+    rules: readRulesFromDom(),
   };
-}
-
-async function refreshStatus() {
-  try {
-    const s = await (await fetch('/api/status')).json();
-    const dot = document.querySelector('.dot');
-    // header badge
-    const badge = $('#stateBadge');
-    badge.className = 'badge ' + (badgeClass[s.state] || 'off');
-    badge.textContent = stateNames[s.state] || s.state;
-    let detail = '';
-    if (s.connectedAt) detail += '  since ' + new Date(s.connectedAt).toLocaleString();
-    if (s.lastError) detail += '  err: ' + s.lastError;
-    $('#stateText').textContent = stateNames[s.state] || s.state;
-    $('#stateDetail').textContent = detail;
-    $('#btnStart').disabled = s.state === 'connected';
-    $('#btnStop').disabled = s.state === 'stopped';
-  } catch { /* transient */ }
-}
-
-async function load() {
-  const d = await (await fetch('/api/config')).json();
-  fillForm(d.config);
-  refreshStatus();
-}
-
-$('#fAuthMode').onchange = toggleAuthFields;
-
-$('#btnSave').onclick = async () => {
   const res = await fetch('/api/config', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(collectForm()),
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
   });
   const d = await res.json();
-  if (!res.ok) return toast(d.error || 'save failed');
-  toast(d.restarted ? 'saved & reconnected' : 'saved');
-  refreshStatus();
+  if (!res.ok) return { ok: false, error: d.error || 'save failed' };
+  if (!silent) toast('saved & applied');
+  return { ok: true, config: d.config };
+}
+
+$('#btnSave').onclick = () => saveConfig();
+
+$('#btnAddRule').onclick = () => {
+  rules.push({ name: '', target: '', authMode: 'secret', secret: $('#fRelay').dataset.secretHint || '', token: '' });
+  renderRules();
 };
 
 $('#btnStart').onclick = async () => {
+  const saved = await saveConfig(true);
+  if (!saved.ok) return toast(saved.error);
   const res = await fetch('/api/tunnel', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'start' }) });
   const d = await res.json();
   if (!res.ok) return toast(d.error || 'start failed');
-  toast('connecting...');
+  toast('connecting all...');
   setTimeout(refreshStatus, 500);
 };
 
 $('#btnStop').onclick = async () => {
   await fetch('/api/tunnel', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'stop' }) });
-  toast('disconnected');
+  toast('all disconnected');
   refreshStatus();
 };
 
-$('#btnTest').onclick = async () => {
-  const el = $('#testResult');
-  el.className = 'test-result muted';
-  el.textContent = 'testing...';
-  const res = await fetch('/api/test-target', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ target: $('#fTarget').value.trim() }),
-  });
-  const d = await res.json();
-  el.className = 'test-result ' + (d.ok ? 'ok' : 'bad');
-  el.style.color = d.ok ? 'var(--ok)' : 'var(--off)';
-  el.textContent = d.ok ? '[ok] ' + d.message : '[fail] ' + d.message;
-};
+async function refreshStatus() {
+  try {
+    const s = await (await fetch('/api/status')).json();
+    const badge = $('#stateBadge');
+    const st = s.anyConnected ? 'connected' : (s.connecting ? 'connecting' : 'stopped');
+    badge.className = 'badge ' + (badgeClass[st] || 'off');
+    badge.textContent = stateNames[st];
+    const summary = (s.rules || []).map(r => `${r.name}:${stateNames[r.state] || r.state}`).join('  ');
+    $('#stateText').textContent = summary || '-';
+    $('#btnStart').disabled = s.anyConnected;
+    $('#btnStop').disabled = !s.anyConnected && !s.connecting;
+
+    // 每条规则的状态展示（按规则名匹配 DOM）
+    for (const r of s.rules || []) {
+      const node = [...document.querySelectorAll('#rulesList .rule-item')]
+        .find(n => n.querySelector('[data-f="name"]').value.trim() === r.name);
+      if (!node) continue;
+      const dot = node.querySelector('[data-dot]');
+      dot.className = 'dot ' + (badgeClass[r.state] || 'off');
+      const el = node.querySelector('[data-rstate]');
+      el.textContent = stateNames[r.state] || r.state;
+      el.style.color = r.state === 'connected' ? 'var(--ok)' : (r.state === 'connecting' ? 'var(--warn, orange)' : 'var(--off)');
+      node.querySelector('[data-rname]').textContent = r.name;
+    }
+  } catch { /* transient */ }
+}
+
+async function load() {
+  const d = await (await fetch('/api/config')).json();
+  $('#fRelay').value = d.config.relay || '';
+  $('#fAutoStart').checked = d.config.autoStart !== false;
+  rules = (d.config.rules || []).map(r => ({ ...r }));
+  renderRules();
+  refreshStatus();
+}
 
 load();
 setInterval(refreshStatus, 3000);

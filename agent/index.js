@@ -1,10 +1,11 @@
 // wormhole agent：跑在内网，主动连接 relay，把下发的请求/WS 隧道转发给内网目标。
+// 支持多规则：一条配置里可定义多个 {规则名 → 内网目标}，每条规则一条 WS 连接，互不影响。
 // 自带本地 Web UI（默认 http://127.0.0.1:7810），配置保存在 agent-config.json，界面改动即时生效。
 //
 // 用法:
 //   node agent/index.js                          # 纯 UI 模式，浏览器打开 http://127.0.0.1:7810 配置
 //   node agent/index.js --relay http://relay:7800 --secret xx --name wiki --target http://10.0.0.2:8090
-//                                                # CLI 传参作为初始配置，仍可用 UI 修改
+//                                                # CLI 传参作为第一条规则的初始配置，仍可用 UI 增加/修改
 import http from 'node:http';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -26,169 +27,224 @@ const CONFIG_FILE = path.resolve(arg('--config', path.join(__dirname, 'agent-con
 const RECONNECT_MS = 3000;
 
 // ---------- 配置 ----------
+// 结构: { relay, autoStart, source, rules: [{ name, target, authMode, secret, token }] }
 function loadConfig() {
-  // CLI 参数 → 初始配置；否则读配置文件；否则空配置等 UI 填写
   const cli = {
     relay: (arg('--relay', process.env.RELAY_URL || '') || '').replace(/\/+$/, ''),
     name: arg('--name', process.env.RELAY_NAME || ''),
-    authMode: 'secret',
     secret: arg('--secret', process.env.RELAY_SECRET || ''),
-    token: arg('--token', process.env.RELAY_TOKEN || '') || arg('--token', ''),
+    token: arg('--token', process.env.RELAY_TOKEN || ''),
     target: arg('--target', process.env.RELAY_TARGET || ''),
-    autoStart: true,
   };
-  const hasCli = cli.relay && cli.name && cli.target && (cli.secret || cli.token);
+  const cliRule = cli.relay && cli.name && cli.target && (cli.secret || cli.token)
+    ? [{ name: cli.name, target: cli.target, authMode: cli.token ? 'token' : 'secret', secret: cli.secret, token: cli.token }]
+    : [];
+
   try {
     const saved = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
-    if (hasCli && saved.source === 'ui') {
+    if (cliRule.length && saved.source === 'ui') {
       // UI 保存过的配置优先于重复的 CLI 参数（便于 systemd 里固定传参的场景）
       return normalize(saved);
     }
-    return normalize(hasCli ? { ...cli, source: 'cli' } : saved);
+    if (cliRule.length) return normalize({ relay: cli.relay, autoStart: true, source: 'cli', rules: cliRule });
+    return normalize(saved);
   } catch {
-    return normalize(hasCli ? { ...cli, source: 'cli' } : { relay: '', name: '', authMode: 'secret', secret: '', token: '', target: '', autoStart: true, source: 'ui' });
+    if (cliRule.length) return normalize({ relay: cli.relay, autoStart: true, source: 'cli', rules: cliRule });
+    return normalize({ relay: '', autoStart: true, source: 'ui', rules: [] });
   }
 }
 
+function normalizeRule(r) {
+  return {
+    name: String(r?.name || '').trim(),
+    target: String(r?.target || ''),
+    authMode: r?.authMode === 'token' ? 'token' : 'secret',
+    secret: String(r?.secret || ''),
+    token: String(r?.token || ''),
+  };
+}
+
 function normalize(c) {
+  // 旧版单规则配置（顶层 name/target/...）自动迁移为 rules[0]
+  let rules = Array.isArray(c.rules) ? c.rules.map(normalizeRule) : [];
+  if (!rules.length && c.name && c.target) {
+    rules = [normalizeRule({ name: c.name, target: c.target, authMode: c.authMode, secret: c.secret, token: c.token })];
+  }
   return {
     relay: String(c.relay || '').replace(/\/+$/, ''),
-    name: String(c.name || '').trim(),
-    authMode: c.authMode === 'token' ? 'token' : 'secret',
-    secret: String(c.secret || ''),
-    token: String(c.token || ''),
-    target: String(c.target || ''),
     autoStart: c.autoStart !== false,
     source: c.source === 'cli' ? 'cli' : 'ui',
+    rules,
   };
 }
 
 let cfg = loadConfig();
 
-// ---------- 隧道状态 ----------
-let ws = null;
-let tunnelState = 'stopped'; // stopped | connecting | connected
-let lastError = '';
-let connectedAt = null;
-let reconnectTimer = null;
-let wantConnected = false;
-
-const pendingBodyHandlers = new Map(); // id -> handler(type, payload)
-const wsTunnels = new Map();           // id -> target socket
-
-function authToken() {
-  if (cfg.authMode === 'token') return cfg.token;
-  return crypto.createHash('sha256').update(`${cfg.name}::${cfg.secret}`).digest('hex');
+function validateRule(r) {
+  const errors = [];
+  if (!r.name) errors.push('规则名不能为空');
+  else if (!/^[a-z0-9][a-z0-9-]{0,62}$/i.test(r.name)) errors.push(`规则名 "${r.name}" 只能包含字母、数字、连字符`);
+  if (r.authMode === 'token' && !r.token) errors.push(`规则 "${r.name}" 缺少规则 token`);
+  if (r.authMode === 'secret' && !r.secret) errors.push(`规则 "${r.name}" 缺少共享密钥`);
+  if (!r.target) errors.push(`规则 "${r.name}" 缺少目标网站地址`);
+  else if (!/^https?:\/\//.test(r.target)) errors.push(`规则 "${r.name}" 的目标地址需以 http:// 或 https:// 开头`);
+  return errors;
 }
 
 function validateConfig(c) {
   const errors = [];
   if (!c.relay) errors.push('relay 地址不能为空');
-  if (!/^https?:\/\//.test(c.relay)) errors.push('relay 地址需以 http:// 或 https:// 开头');
-  if (!/^[a-z0-9][a-z0-9-]{0,62}$/i.test(c.name)) errors.push('规则名只能包含字母、数字、连字符');
-  if (c.authMode === 'secret' && !c.secret) errors.push('缺少共享密钥');
-  if (c.authMode === 'token' && !c.token) errors.push('缺少规则 token');
-  if (!c.target) errors.push('目标网站地址不能为空');
-  if (c.target && !/^https?:\/\//.test(c.target)) errors.push('目标地址需以 http:// 或 https:// 开头');
+  if (c.relay && !/^https?:\/\//.test(c.relay)) errors.push('relay 地址需以 http:// 或 https:// 开头');
+  if (!c.rules.length) errors.push('至少需要一条规则');
+  const seen = new Set();
+  for (const r of c.rules) {
+    if (seen.has(r.name)) errors.push(`规则名 "${r.name}" 重复`);
+    seen.add(r.name);
+    errors.push(...validateRule(r));
+  }
   return errors;
 }
 
-function connect() {
-  if (ws) { try { ws.terminate(); } catch { } ws = null; }
-  clearTimeout(reconnectTimer);
-  wantConnected = true;
-  tunnelState = 'connecting';
-  lastError = '';
+// ---------- 隧道状态（每条规则一个） ----------
+// tunnels: name -> { ws, state, lastError, connectedAt, reconnectTimer, wantConnected, pendingBodyHandlers, wsTunnels, hbTimer }
+const tunnels = new Map();
 
-  const url = `${cfg.relay}/agent/ws?name=${encodeURIComponent(cfg.name)}&token=${encodeURIComponent(authToken())}`;
+function getTunnel(name) {
+  let t = tunnels.get(name);
+  if (!t) {
+    t = {
+      name,
+      ws: null,
+      state: 'stopped',
+      lastError: '',
+      connectedAt: null,
+      reconnectTimer: null,
+      wantConnected: false,
+      pendingBodyHandlers: new Map(),
+      wsTunnels: new Map(),
+      hbTimer: null,
+    };
+    tunnels.set(name, t);
+  }
+  return t;
+}
+
+function authToken(rule) {
+  if (rule.authMode === 'token') return rule.token;
+  return crypto.createHash('sha256').update(`${rule.name}::${rule.secret}`).digest('hex');
+}
+
+function cleanupTunnel(t) {
+  t.pendingBodyHandlers.clear();
+  for (const [, s] of t.wsTunnels) { try { s.destroy(); } catch { } }
+  t.wsTunnels.clear();
+}
+
+function connectRule(rule) {
+  if (!cfg.relay) return;
+  const t = getTunnel(rule.name);
+  if (t.ws) { try { t.ws.terminate(); } catch { } t.ws = null; }
+  clearTimeout(t.reconnectTimer);
+  t.wantConnected = true;
+  t.state = 'connecting';
+  t.lastError = '';
+
+  const url = `${cfg.relay}/agent/ws?name=${encodeURIComponent(rule.name)}&token=${encodeURIComponent(authToken(rule))}`;
   const sock = new WebSocket(url);
-  ws = sock;
+  t.ws = sock;
   let alive = true;
 
   sock.on('open', () => {
-    if (ws !== sock) return;
-    tunnelState = 'connected';
-    connectedAt = Date.now();
-    console.log(`[${new Date().toISOString()}] 已连接 relay ${cfg.relay}（规则: ${cfg.name} → ${cfg.target}）`);
+    if (t.ws !== sock) return;
+    t.state = 'connected';
+    t.connectedAt = Date.now();
+    console.log(`[${new Date().toISOString()}] [${rule.name}] 已连接 relay ${cfg.relay}（目标: ${rule.target}）`);
   });
 
   sock.on('message', (data, isBinary) => {
-    if (ws !== sock || !isBinary) return;
+    if (t.ws !== sock || !isBinary) return;
     const frame = decode(data);
     if (!frame) return;
     try {
-      if (frame.type === T.REQ_HEAD) handleHttp(frame, jsonPayload(frame));
-      else if (frame.type === T.WS_OPEN) handleWsOpen(frame, jsonPayload(frame));
-      else routeFrame(frame);
+      if (frame.type === T.REQ_HEAD) handleHttp(rule, t, frame, jsonPayload(frame));
+      else if (frame.type === T.WS_OPEN) handleWsOpen(rule, t, frame, jsonPayload(frame));
+      else routeFrame(t, frame);
     } catch (e) {
-      console.error('[frame] 处理失败:', e.message);
+      console.error(`[${rule.name}] [frame] 处理失败:`, e.message);
     }
   });
 
   sock.on('pong', () => { alive = true; });
   sock.on('close', () => {
-    if (ws !== sock) return;
-    ws = null;
-    cleanupAll();
-    if (wantConnected) {
-      tunnelState = 'connecting';
-      lastError = '连接断开，等待重连…';
-      reconnectTimer = setTimeout(connect, RECONNECT_MS);
+    if (t.ws !== sock) return;
+    t.ws = null;
+    clearInterval(t.hbTimer);
+    cleanupTunnel(t);
+    if (t.wantConnected) {
+      t.state = 'connecting';
+      t.lastError = '连接断开，等待重连…';
+      t.reconnectTimer = setTimeout(() => connectRule(rule), RECONNECT_MS);
     } else {
-      tunnelState = 'stopped';
+      t.state = 'stopped';
     }
-    console.log(`[${new Date().toISOString()}] 与 relay 断开`);
+    console.log(`[${new Date().toISOString()}] [${rule.name}] 与 relay 断开`);
   });
   sock.on('error', (e) => {
-    if (ws !== sock) return;
-    lastError = e.message;
-    console.error(`[ws] 连接错误: ${e.message}`);
+    if (t.ws !== sock) return;
+    t.lastError = e.message;
+    console.error(`[${rule.name}] [ws] 连接错误: ${e.message}`);
   });
 
-  const hb = setInterval(() => {
-    if (ws !== sock || sock.readyState !== WebSocket.OPEN) { clearInterval(hb); return; }
+  t.hbTimer = setInterval(() => {
+    if (t.ws !== sock || sock.readyState !== WebSocket.OPEN) { clearInterval(t.hbTimer); return; }
     alive = false;
     sock.ping();
     setTimeout(() => {
-      if (ws === sock && !alive) sock.terminate();
+      if (t.ws === sock && !alive) sock.terminate();
     }, 10000);
   }, 30000);
-  sock.on('close', () => clearInterval(hb));
 }
 
-function disconnect() {
-  wantConnected = false;
-  clearTimeout(reconnectTimer);
-  if (ws) { try { ws.close(); } catch { } }
-  ws = null;
-  cleanupAll();
-  tunnelState = 'stopped';
-  lastError = '';
+function disconnectRule(name) {
+  const t = tunnels.get(name);
+  if (!t) return;
+  t.wantConnected = false;
+  clearTimeout(t.reconnectTimer);
+  if (t.ws) { try { t.ws.close(); } catch { } }
+  t.ws = null;
+  clearInterval(t.hbTimer);
+  cleanupTunnel(t);
+  t.state = 'stopped';
+  t.lastError = '';
 }
 
-function cleanupAll() {
-  pendingBodyHandlers.clear();
-  for (const [, s] of wsTunnels) { try { s.destroy(); } catch { } }
-  wsTunnels.clear();
+function connectAll() {
+  for (const rule of cfg.rules) connectRule(rule);
 }
 
-function send(type, id, payload) {
-  if (ws && ws.readyState === WebSocket.OPEN) ws.send(encode(type, id, payload));
+function disconnectAll() {
+  for (const name of [...tunnels.keys()]) disconnectRule(name);
+}
+
+function send(t, type, id, payload) {
+  if (t.ws && t.ws.readyState === WebSocket.OPEN) t.ws.send(encode(type, id, payload));
 }
 
 // ---------- HTTP 转发（流式） ----------
-let targetUrl = null;
-function targetOrigin() {
-  try { targetUrl = new URL(cfg.target); } catch { return null; }
-  return targetUrl;
+const targetUrls = new Map(); // name -> URL | null
+function targetOrigin(rule) {
+  if (!targetUrls.has(rule.name)) {
+    try { targetUrls.set(rule.name, new URL(rule.target)); } catch { targetUrls.set(rule.name, null); }
+  }
+  return targetUrls.get(rule.name);
 }
 
-function handleHttp(headFrame, head) {
+function handleHttp(rule, t, headFrame, head) {
   if (!head) return;
   const { id } = headFrame;
-  const tu = targetUrl || targetOrigin();
+  const tu = targetOrigin(rule);
   if (!tu) {
-    send(T.RESP_ERROR, id, { message: '目标地址无效', code: 'TARGET_FAILED' });
+    send(t, T.RESP_ERROR, id, { message: '目标地址无效', code: 'TARGET_FAILED' });
     return;
   }
   const targetHeaders = { ...head.headers };
@@ -208,38 +264,38 @@ function handleHttp(headFrame, head) {
       headers: targetHeaders,
     },
     (res) => {
-      send(T.RESP_HEAD, id, {
+      send(t, T.RESP_HEAD, id, {
         status: res.statusCode,
         statusText: res.statusMessage || '',
         headers: res.headers,
         targetOrigin: tu.origin,
       });
-      res.on('data', (c) => send(T.RESP_BODY, id, c));
-      res.on('end', () => send(T.RESP_END, id));
-      res.on('error', () => send(T.RESP_END, id));
+      res.on('data', (c) => send(t, T.RESP_BODY, id, c));
+      res.on('end', () => send(t, T.RESP_END, id));
+      res.on('error', () => send(t, T.RESP_END, id));
     }
   );
 
   upstream.on('error', (e) => {
-    send(T.RESP_ERROR, id, { message: `访问内网目标失败: ${e.message}`, code: 'TARGET_FAILED' });
+    send(t, T.RESP_ERROR, id, { message: `访问内网目标失败: ${e.message}`, code: 'TARGET_FAILED' });
   });
 
-  pendingBodyHandlers.set(id, (type, payload) => {
+  t.pendingBodyHandlers.set(id, (type, payload) => {
     if (type === T.REQ_BODY) upstream.write(payload);
-    else if (type === T.REQ_END) { upstream.end(); pendingBodyHandlers.delete(id); }
-    else if (type === T.REQ_CANCEL) { upstream.destroy(); pendingBodyHandlers.delete(id); }
+    else if (type === T.REQ_END) { upstream.end(); t.pendingBodyHandlers.delete(id); }
+    else if (type === T.REQ_CANCEL) { upstream.destroy(); t.pendingBodyHandlers.delete(id); }
     // PAUSE/RESUME：server 侧 PassThrough 已缓冲，这里无需处理
   });
 }
 
 // ---------- WebSocket 隧道 ----------
-function handleWsOpen(frame, msg) {
+function handleWsOpen(rule, t, frame, msg) {
   if (!msg) return;
   const { id } = frame;
-  const tu = targetUrl || targetOrigin();
-  if (!tu) { send(T.WS_OPEN_ERR, id, { message: '目标地址无效' }); return; }
+  const tu = targetOrigin(rule);
+  if (!tu) { send(t, T.WS_OPEN_ERR, id, { message: '目标地址无效' }); return; }
   let target;
-  try { target = new URL(msg.url, tu.origin); } catch { send(T.WS_OPEN_ERR, id, { message: '无效的 WS 路径' }); return; }
+  try { target = new URL(msg.url, tu.origin); } catch { send(t, T.WS_OPEN_ERR, id, { message: '无效的 WS 路径' }); return; }
   const isTLS = target.protocol === 'wss:' || tu.protocol === 'https:';
   const key = crypto.randomBytes(16).toString('base64');
 
@@ -261,29 +317,29 @@ function handleWsOpen(frame, msg) {
     },
   });
   req.on('upgrade', (res, socket, head) => {
-    send(T.WS_OPEN_OK, id, { protocol: res.headers['sec-websocket-protocol'] || '' });
-    if (head?.length) send(T.WS_DATA, id, Buffer.concat([Buffer.from([1]), head]));
-    socket.on('data', (c) => send(T.WS_DATA, id, Buffer.concat([Buffer.from([1]), c])));
-    socket.on('close', () => send(T.WS_CLOSE, id, { code: 1000, reason: '' }));
-    socket.on('error', () => send(T.WS_CLOSE, id, { code: 1011, reason: 'target socket error' }));
-    wsTunnels.set(id, socket);
+    send(t, T.WS_OPEN_OK, id, { protocol: res.headers['sec-websocket-protocol'] || '' });
+    if (head?.length) send(t, T.WS_DATA, id, Buffer.concat([Buffer.from([1]), head]));
+    socket.on('data', (c) => send(t, T.WS_DATA, id, Buffer.concat([Buffer.from([1]), c])));
+    socket.on('close', () => send(t, T.WS_CLOSE, id, { code: 1000, reason: '' }));
+    socket.on('error', () => send(t, T.WS_CLOSE, id, { code: 1011, reason: 'target socket error' }));
+    t.wsTunnels.set(id, socket);
   });
   req.on('response', (res) => {
-    send(T.WS_OPEN_ERR, id, { message: `目标未升级为 WebSocket (HTTP ${res.statusCode})` });
+    send(t, T.WS_OPEN_ERR, id, { message: `目标未升级为 WebSocket (HTTP ${res.statusCode})` });
   });
   req.on('error', (e) => {
-    send(T.WS_OPEN_ERR, id, { message: `连接目标失败: ${e.message}` });
+    send(t, T.WS_OPEN_ERR, id, { message: `连接目标失败: ${e.message}` });
   });
   req.end();
 }
 
-function routeFrame(frame) {
-  const handler = pendingBodyHandlers.get(frame.id);
+function routeFrame(t, frame) {
+  const handler = t.pendingBodyHandlers.get(frame.id);
   if (handler) return handler(frame.type, frame.payload);
-  const tunnel = wsTunnels.get(frame.id);
+  const tunnel = t.wsTunnels.get(frame.id);
   if (tunnel) {
     if (frame.type === T.WS_DATA) tunnel.write(frame.payload.subarray(1));
-    else if (frame.type === T.WS_CLOSE) { tunnel.end(); wsTunnels.delete(frame.id); }
+    else if (frame.type === T.WS_CLOSE) { tunnel.end(); t.wsTunnels.delete(frame.id); }
   }
 }
 
@@ -331,16 +387,26 @@ const uiServer = http.createServer(async (req, res) => {
       const errors = validateConfig(next);
       if (errors.length) return sendJSON(res, 400, { error: errors.join('；') });
 
-      const changed = next.relay !== cfg.relay || next.name !== cfg.name || next.authMode !== cfg.authMode
-        || next.secret !== cfg.secret || next.token !== cfg.token || next.target !== cfg.target;
+      const prevRules = new Map(cfg.rules.map(r => [r.name, r]));
+      const nextRules = new Map(next.rules.map(r => [r.name, r]));
       cfg = next;
       try { fs.writeFileSync(CONFIG_FILE, JSON.stringify(cfg, null, 2)); } catch { /* 保存失败不阻断 */ }
-      if (changed) {
-        // 目标变化时清缓存；连接参数变化时重连
-        targetUrl = null;
-        if (wantConnected || next.autoStart) connect();
+
+      // 目标地址缓存失效
+      targetUrls.clear();
+
+      // 逐条规则对比：停掉已删除的，重连变更的，新增的直接连
+      for (const [name] of prevRules) {
+        if (!nextRules.has(name)) disconnectRule(name);
       }
-      return sendJSON(res, 200, { config: cfg, restarted: changed });
+      for (const rule of next.rules) {
+        const prev = prevRules.get(rule.name);
+        const ruleChanged = !prev || JSON.stringify(rule) !== JSON.stringify(prev);
+        if (ruleChanged) {
+          if (tunnels.get(rule.name)?.wantConnected || next.autoStart) connectRule(rule);
+        }
+      }
+      return sendJSON(res, 200, { config: cfg, restarted: true });
     }
   }
 
@@ -350,22 +416,42 @@ const uiServer = http.createServer(async (req, res) => {
     if (body.action === 'start') {
       const errors = validateConfig(cfg);
       if (errors.length) return sendJSON(res, 400, { error: errors.join('；') });
-      connect();
+      connectAll();
       return sendJSON(res, 200, { ok: true });
     }
     if (body.action === 'stop') {
-      disconnect();
+      disconnectAll();
       return sendJSON(res, 200, { ok: true });
     }
-    return sendJSON(res, 400, { error: 'action 必须是 start 或 stop' });
+    if (body.action === 'start-rule' && body.name) {
+      const rule = cfg.rules.find(r => r.name === body.name);
+      if (!rule) return sendJSON(res, 404, { error: '规则不存在' });
+      const errors = validateRule(rule);
+      if (errors.length) return sendJSON(res, 400, { error: errors.join('；') });
+      connectRule(rule);
+      return sendJSON(res, 200, { ok: true });
+    }
+    if (body.action === 'stop-rule' && body.name) {
+      disconnectRule(body.name);
+      return sendJSON(res, 200, { ok: true });
+    }
+    return sendJSON(res, 400, { error: 'action 必须是 start / stop / start-rule / stop-rule' });
   }
 
   if (pathName === '/api/status' && req.method === 'GET') {
+    const rules = cfg.rules.map(r => {
+      const t = tunnels.get(r.name);
+      return {
+        name: r.name,
+        state: t?.state || 'stopped',
+        lastError: t?.lastError || '',
+        connectedAt: t?.connectedAt || null,
+      };
+    });
     return sendJSON(res, 200, {
-      state: tunnelState,
-      lastError,
-      connectedAt,
-      targetOnline: null, // 填了配置后由前端探测
+      rules,
+      anyConnected: rules.some(r => r.state === 'connected'),
+      connecting: rules.some(r => r.state === 'connecting'),
     });
   }
 
@@ -373,7 +459,7 @@ const uiServer = http.createServer(async (req, res) => {
   if (pathName === '/api/test-target' && req.method === 'POST') {
     let body;
     try { body = JSON.parse(await readBody(req)); } catch { body = {}; }
-    const t = body.target || cfg.target;
+    const t = body.target || '';
     let tu;
     try { tu = new URL(t); } catch { return sendJSON(res, 200, { ok: false, message: '目标地址无效' }); }
     return new Promise((resolve) => {
@@ -394,10 +480,11 @@ const uiServer = http.createServer(async (req, res) => {
 uiServer.listen(UI_PORT, () => {
   console.log(`agent 管理界面: http://127.0.0.1:${UI_PORT}`);
   console.log(`配置文件: ${CONFIG_FILE}`);
-  // CLI 给了完整配置则自动启动隧道
-  if (cfg.autoStart && validateConfig(cfg).length === 0) {
-    connect();
-  } else if (validateConfig(cfg).length) {
+  // 配置完整则自动启动所有规则
+  const errors = validateConfig(cfg);
+  if (cfg.autoStart && !errors.length) {
+    connectAll();
+  } else if (errors.length) {
     console.log('配置不完整，请在管理界面中完成配置');
   }
 });
