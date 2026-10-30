@@ -63,3 +63,27 @@ export function jsonPayload(frame) {
     return null;
   }
 }
+
+// ---------- WS close 帧合法性 ----------
+// close 帧只能携带 1000-4999 的状态码，且 1005/1006/1015 是保留码、不允许出现在线上。
+// 浏览器/目标站关闭连接时经常不带状态码（对端看到的就是 1005），如果原样转发，
+// 收到的一端（ws 库）会直接抛 "invalid status code" 错误。
+export function sanitizeCloseCode(code) {
+  const n = Number(code);
+  if (!Number.isInteger(n)) return 1000;
+  if (n === 1005 || n === 1006 || n === 1015) return 1000;
+  if (n < 1000 || n > 4999) return 1000;
+  return n;
+}
+
+// close 帧 payload 上限 125 字节（含 2 字节状态码），reason 超过就会让发送方抛异常
+export function sanitizeCloseReason(reason, maxBytes = 123) {
+  const s = typeof reason === 'string' ? reason : '';
+  if (Buffer.byteLength(s) <= maxBytes) return s;
+  let out = '';
+  for (const ch of s) {
+    if (Buffer.byteLength(out + ch) > maxBytes) break;
+    out += ch;
+  }
+  return out;
+}

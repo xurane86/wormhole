@@ -69,6 +69,38 @@ node server/index.js --port 7800 --secret ... --default-rule intranet-wiki
 - WebSocket 透传：浏览器到内网目标的应用层 WebSocket 连接会在 relay 上自动桥接（含路径模式 `/p/{name}/ws/...`、子域名模式与下述 `--default-rule` 兑底模式）。文本/二进制帧原样透传，客户端请求的子协议由目标选中的协议回显；规则不存在返回 404、规则停用返回 502、agent 离线返回 503。注意：JS 发起的 `fetch("/api/...")` 等绝对路径请求在路径模式下仍无法由 relay 改写，SPA 类应用建议配置应用自身 basePath
 - 请求/响应头按需透传，自动处理 `Host`、`X-Forwarded-*`
 
+### WebSocket 保活与心跳
+
+- **relay → 浏览器**：relay 每 30s 给浏览器侧连接发一次 Ping（浏览器会自动回 Pong，对页面无感）。这不是可选优化：前置的 Cloudflare（空闲 100s 断连）、nginx（`proxy_read_timeout` 默认 60s）等会把长时间没有数据的 WebSocket 掐掉，表现为“连上一会儿就断开”。间隔可用 `RELAY_WS_KEEPALIVE_MS` 调整；连续 3 次收不到 Pong 才判死并回收连接。
+- **agent → 内网目标**：目标站若用 RFC6455 的 Ping 做心跳（很常见），agent 会原样回 Pong（含 Ping 携带的数据），不会因为漏回心跳被目标判死断开；分片消息（continuation 帧）会被正确拼回。
+- **close 码**：浏览器不带状态码关闭时看到的是保留码 1005/1006，这类码不允许出现在线上，relay/agent 会归一化成 1000 再转发，避免对端 ws 库报 `invalid status code`。
+
+## 排查：子域名模式连上一会儿就断开
+
+按以下顺序看：
+
+1. **前置代理的空闲超时**：浏览器 → Cloudflare/nginx → relay 这条链路上，WS 空闲会被中间层掐断。relay 已内置 30s 保活 Ping；若仍偶发，检查反向代理的 `proxy_read_timeout`/`proxy_send_timeout` 是否小于 30s。
+2. **目标站自己的心跳**：确认 agent 侧日志没有 `与 relay 断开`，同时目标站日志里没有 `no pong`/心跳超时。agent 会回 Pong，若目标站用的是应用层心跳（JSON 消息而非 WS 控制帧），relay 只做透传，需要目标站自身正确应答。
+3. **agent 是否在反复重连**：relay 控制台会打印 `[agent] "xxx" 已连接 / 已断开`。若频繁出现，说明 relay 与 agent 之间的链路不稳（网络/前置代理），此时浏览器侧的所有 WS 都会跟着断。
+4. **路径模式下的应用**：若应用前端用绝对路径（Next.js 的 `/_next/...`、`/api/...`、`ws://host/ws` 等），路径模式本身就无法工作，见下节。
+
+## 路径模式能接什么、不能接什么
+
+路径模式（`/p/{name}/`）只在「应用自身支持配置 BaseURL/basePath」时才完整可用：
+
+- 能接：支持 BaseURL 的 Wiki、文档站、后台系统；纯静态站（relay 会注入 `<base>` 并改写 HTML/CSS 里的绝对路径）。
+- 接不了：前端硬编码绝对路径的 SPA（Next.js 的 `/_next/*` 与 RSC 请求、`fetch("/api/x")`、`new WebSocket(origin + "/ws")`）。这些请求由 JS 运行时发起，relay 改不到，会直接打到 relay 根路径上（404 或落到别的规则）。
+- 这类应用用**子域名模式**，或给应用配 basePath；单应用部署也可以用 `--default-rule` 兑底。
+
+## 测试
+
+```bash
+npm test        # test/e2e.mjs：同进程拉起 relay + agent + 模拟目标站
+```
+
+覆盖路径/子域名两种模式的 HTTP 与 WS 转发、目标侧心跳（Ping→Pong）、WS 子协议协商、relay 侧保活。
+
+
 ## 管理页面
 
 `http://relay:7800/admin`

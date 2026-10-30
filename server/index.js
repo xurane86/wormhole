@@ -13,6 +13,7 @@ import {
   rewriteResponseHeaders,
   canRewriteText,
 } from './rewrite.js';
+import { sanitizeCloseCode, sanitizeCloseReason } from '../shared/protocol.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -252,8 +253,10 @@ async function handleForward(req, res, ruleName, innerPath, pathMode = true) {
     bytesIn: body?.length || 0,
   });
 
-  // 客户端断开时中止上游请求
-  req.on('close', () => { if (!res.writableEnded) fwd.abort?.(); });
+  // 客户端断开时中止上游请求。
+  // 注意必须监听 res 而不是 req：Node 16+ 里 req 的 'close' 在「请求体读完」时就触发
+  // （POST 时远早于响应返回，用它会把正常请求误杀），res 的 'close' 才是真正的连接结束。
+  res.on('close', () => { if (!res.writableEnded) fwd.abort?.(); });
 
   // 发送请求体
   if (body?.length) fwd.write(body);
@@ -302,18 +305,43 @@ function noticePage(title, msg) {
 // ---------- Agent WebSocket 接入 ----------
 const wss = new WebSocketServer({ noServer: true });
 // 浏览器侧 WS 桥接专用实例（与 agent 的 wss 分开，避免 noServer 升级路径互相干扰）
-// 子协议回显：目标选中的协议通过 handleProtocols 写入 101 响应（ws.protocol 是只读 getter，不能直接赋值）
-let selectedProtocol = '';
+// 子协议回显：目标选中的协议通过 handleProtocols 写入 101 响应（ws.protocol 是只读 getter，不能直接赋值）。
+// 协商结果必须按「本次升级请求」传递：早先用模块级变量保存，多个浏览器连接并发升级时会互相串台
+// （回给浏览器的子协议不是它请求的那个，浏览器直接判定失败 → 表现成“刚连上就断”）。
+const negotiatedProtocol = new WeakMap(); // http.IncomingMessage -> 目标选中的子协议
 const wssBrowser = new WebSocketServer({
   noServer: true,
-  handleProtocols: (protocols) => {
-    // 桥接模式下目标已选好协议；这里从客户端请求的列表里匹配目标选中的那个
-    for (const p of protocols) {
-      if (!selectedProtocol || p === selectedProtocol) return p;
-    }
-    return selectedProtocol || false;
+  handleProtocols: (protocols, request) => {
+    const list = [...protocols];
+    const want = negotiatedProtocol.get(request) || '';
+    // 目标确实选了这个协议才回它（如 codeg 的 codeg-token.* 就是靠这个子协议带鉴权 token）
+    if (want && list.includes(want)) return want;
+    // 目标没选协议（或选了客户端没请求的）：回客户端请求的第一个，避免浏览器因“服务端未选协议”直接判失败
+    return list[0] || false;
   },
 });
+
+// WS 保活：前置 CDN/反代会掐掉长时间无数据的 WS（Cloudflare 空闲 100s、nginx proxy_read_timeout 默认 60s），
+// 所以 relay 必须主动 ping 浏览器侧连接；同时用 pong 判断对端是否已死，避免半开连接一直挂着。
+// 可用 RELAY_WS_KEEPALIVE_MS 覆盖（测试用）。
+const WS_KEEPALIVE_MS = parseInt(process.env.RELAY_WS_KEEPALIVE_MS || '', 10) || 30_000;
+const WS_KEEPALIVE_MAX_MISS = 3; // 连续 3 次没 pong（约 90s）才判死，避免网络抖动误杀
+function attachKeepalive(ws) {
+  let missed = 0;
+  ws.isAlive = true;
+  ws.on('pong', () => { ws.isAlive = true; missed = 0; });
+  const timer = setInterval(() => {
+    if (ws.readyState !== 1) { clearInterval(timer); return; }
+    if (!ws.isAlive) {
+      missed += 1;
+      if (missed >= WS_KEEPALIVE_MAX_MISS) { clearInterval(timer); try { ws.terminate(); } catch { } return; }
+    }
+    ws.isAlive = false;
+    try { ws.ping(); } catch { }
+  }, WS_KEEPALIVE_MS);
+  ws.on('close', () => clearInterval(timer));
+  return () => clearInterval(timer);
+}
 
 // WS 规则解析：与 HTTP 路由同一套逻辑（路径模式 → 子域名模式 → 兑底）
 function resolveWsRule(req, url) {
@@ -359,12 +387,8 @@ server.on('upgrade', (req, socket, head) => {
       });
       sock.on('error', () => hub.unregister(conn));
 
-      // 心跳
-      const ping = setInterval(() => {
-        if (sock.readyState === 1) sock.ping();
-        else clearInterval(ping);
-      }, 30000);
-      sock.on('close', () => clearInterval(ping));
+      // 心跳 + 死连接清理：agent 侧 ws 库会自动回 pong
+      attachKeepalive(sock);
     });
   }
 
@@ -392,11 +416,13 @@ server.on('upgrade', (req, socket, head) => {
   // onData/onClose 在拿到 tunnel 后立刻赋值：目标可能抢先发数据，不能等 ready
   let client = null;       // handleUpgrade 完成后的客户端 ws
   let closed = false;      // 幂等清理标志
+  let stopKeepalive = null; // 浏览器侧保活定时器
   const cleanup = () => {
     if (closed) return;
     closed = true;
     tunnel.onData = null;
     tunnel.onClose = null;
+    stopKeepalive?.();
     if (client) {
       client.removeAllListeners('message');
       client.removeAllListeners('close');
@@ -407,11 +433,12 @@ server.on('upgrade', (req, socket, head) => {
     if (client && client.readyState === 1) client.send(data, { binary: isBinary });
   };
   tunnel.onClose = (info) => {
-    const code = typeof info?.code == "number" ? info.code : 1011;
-    const reason = typeof info?.reason == "string" ? info.reason : (info?.message || "upstream closed");
+    // close 码必须净化：浏览器不带状态码关闭时这里是 1005，原样回给 ws 客户端会抛 “invalid status code”
+    const code = sanitizeCloseCode(typeof info?.code == "number" ? info.code : 1011);
+    const reason = sanitizeCloseReason(typeof info?.reason == "string" ? info.reason : (info?.message || "upstream closed"));
     cleanup();
     if (client) {
-      if (client.readyState <= 1) client.close(code, reason);
+      if (client.readyState <= 1) { try { client.close(code, reason); } catch { } }
       return;
     }
     // 尚未完成对浏览器的 101 升级：必须明确回错，否则浏览器一直挂着
@@ -429,15 +456,17 @@ server.on('upgrade', (req, socket, head) => {
   tunnel.ready.then(({ protocol }) => {
     if (closed) return;
     clearTimeout(readyTimeout);
-    selectedProtocol = protocol || '';
+    negotiatedProtocol.set(req, protocol || '');
     // 完成对客户端的 101 升级（子协议由 wssBrowser.handleProtocols 回显），再开始双向桥接
     wssBrowser.handleUpgrade(req, socket, head, (ws) => {
       if (closed) { try { ws.close(); } catch { } return; }
       client = ws;
+      // 保活：前置 CDN/反代空闲超时会掐断 WS，且浏览器会自动回 pong，对页面无感
+      stopKeepalive = attachKeepalive(ws);
       ws.on('message', (data, isBinary) => tunnel.send(data, isBinary));
       ws.on('close', (code, reason) => {
         cleanup();
-        tunnel.close(code, reason.toString().slice(0, 120));
+        tunnel.close(sanitizeCloseCode(code), sanitizeCloseReason(reason.toString()));
       });
       ws.on('error', () => {
         cleanup();

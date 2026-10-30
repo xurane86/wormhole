@@ -12,7 +12,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import WebSocket from 'ws';
-import { T, encode, decode, jsonPayload } from '../shared/protocol.js';
+import { T, encode, decode, jsonPayload, sanitizeCloseCode, sanitizeCloseReason } from '../shared/protocol.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -329,12 +329,19 @@ function handleWsOpen(rule, t, frame, msg) {
           code = payload.readUInt16BE(0);
           reason = payload.subarray(2).toString();
         }
-        send(t, T.WS_CLOSE, id, { code, reason });
+        send(t, T.WS_CLOSE, id, { code: sanitizeCloseCode(code), reason: sanitizeCloseReason(reason) });
         socket.end();
         t.wsTunnels.delete(id);
         return;
       }
-      if (opcode === 0x9 || opcode === 0xA) return; // ping/pong 忽略
+      if (opcode === 0x9) {
+        // 必须回 Pong（RFC6455 §5.5.3，且要原样带回 Ping 的 application data）。
+        // 目标站常用「发 Ping、收不到 Pong 就判定连接死亡」做心跳，不回就是连上一会儿后被它主动断开。
+        // agent 在目标面前是客户端，回帧必须掩码（encodeWsFrame 已处理）。
+        try { socket.write(encodeWsFrame(payload, 0xA)); } catch { /* socket 已关闭，交给 close 事件收尾 */ }
+        return;
+      }
+      if (opcode === 0xA) return; // Pong 忽略
       if (opcode === 0x1 || opcode === 0x2) {
         send(t, T.WS_DATA, id, Buffer.concat([Buffer.from([opcode === 0x2 ? 1 : 0]), payload]));
       }
@@ -353,14 +360,20 @@ function handleWsOpen(rule, t, frame, msg) {
 }
 
 // RFC6455 客户端帧封装（必须掩码）。opcode: 0x1 文本 / 0x2 binary / 0x8 close
-// RFC6455 帧流解析器（服务端视角：帧不带掩码；支持分片/跨包）。回调 (payload, opcode)
+// RFC6455 帧流解析器（服务端视角：帧不带掩码；支持跨包与分片）。
+// 回调只在「一条完整消息」就绪时触发：(payload, opcode)，opcode 为 0x1/0x2（数据）、0x8/0x9/0xA（控制帧）。
+// 分片消息（首帧 FIN=0 + 若干 continuation 0x0）会被拼回一条，避免丢数据；
+// 控制帧可以插在分片中间，因此控制帧单独即时回调。
 function createWsFrameDecoder(onFrame) {
   let buf = Buffer.alloc(0);
+  let frags = [];       // 未完成消息的分片
+  let fragOpcode = 0;
   return (chunk) => {
     buf = buf.length ? Buffer.concat([buf, chunk]) : chunk;
     for (;;) {
       if (buf.length < 2) return;
       const b0 = buf[0], b1 = buf[1];
+      const fin = (b0 & 0x80) !== 0;
       const opcode = b0 & 0x0f;
       const masked = (b1 & 0x80) !== 0;
       let len = b1 & 0x7f, off = 2;
@@ -380,6 +393,30 @@ function createWsFrameDecoder(onFrame) {
         for (let i = 0; i < payload.length; i++) payload[i] ^= mk[i & 3];
       }
       buf = buf.subarray(off + mask + len);
+
+      if (opcode === 0x0) {
+        // continuation：拼到当前消息上
+        if (frags.length) {
+          frags.push(payload);
+          if (fin) {
+            const full = frags.length === 1 ? frags[0] : Buffer.concat(frags);
+            frags = [];
+            onFrame(full, fragOpcode);
+            fragOpcode = 0;
+          }
+        }
+        continue;
+      }
+      if (opcode === 0x1 || opcode === 0x2) {
+        if (fin) {
+          onFrame(payload, opcode);
+        } else {
+          frags = [payload];
+          fragOpcode = opcode;
+        }
+        continue;
+      }
+      // 控制帧（close/ping/pong）永远不分片，即时回调
       onFrame(payload, opcode);
     }
   };
@@ -424,9 +461,12 @@ function routeFrame(t, frame) {
       const isBinary = frame.payload[0] === 1;
       tunnel.write(encodeWsFrame(appData, isBinary ? 0x2 : 0x1));
     } else if (frame.type === T.WS_CLOSE) {
-      // 携带 close code/reason 封成 close 帧（JSON payload），让对端拿到真实关闭码
+      // 携带 close code/reason 封成 close 帧（JSON payload），让对端拿到真实关闭码。
+      // code/reason 必须先净化：relay 侧可能把 1005/1006 这类保留码（“对端没带状态码”）传下来。
       let code = 1000, reason = '';
       try { const m = JSON.parse(frame.payload.toString() || '{}'); code = m.code || 1000; reason = m.reason || ''; } catch { }
+      code = sanitizeCloseCode(code);
+      reason = sanitizeCloseReason(reason);
       const body = Buffer.alloc(2 + Buffer.byteLength(reason));
       body.writeUInt16BE(code, 0);
       body.write(reason, 2);
