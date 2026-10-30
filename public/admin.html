@@ -88,7 +88,13 @@ function fmtBytes(n) {
 }
 
 function entryURL(r) {
-  return ROOT ? `http://${r.name}.${ROOT}/` : `${location.origin}/p/${r.name}/`;
+  // 路径模式永远可用，作为主入口展示
+  return `${location.origin}/p/${r.name}/`;
+}
+
+// 子域名模式入口（需要 *.域名 的泛域名证书，否则 HTTPS 不可用）
+function entryURLAlt(r) {
+  return ROOT ? `http://${r.name}.${ROOT}/` : '';
 }
 
 async function load() {
@@ -97,7 +103,7 @@ async function load() {
   rules = data.rules;
   ROOT = data.rootDomain || '';
   const mode = ROOT
-    ? `subdomain: {rule}.${ROOT}`
+    ? `path: ${location.origin}/p/{rule}/  ·  subdomain: {rule}.${ROOT}`
     : `path: ${location.origin}/p/{rule}/`;
   $('#modeHint').textContent = mode;
   $('#modeHint2').textContent = mode;
@@ -158,6 +164,16 @@ function render() {
     a.style.fontSize = '12px';
     a.textContent = entryURL(r);
     tdEntry.appendChild(a);
+    if (ROOT) {
+      const alt = document.createElement('a');
+      alt.href = entryURLAlt(r);
+      alt.target = '_blank';
+      alt.style.display = 'block';
+      alt.style.fontSize = '12px';
+      alt.style.opacity = '0.65';
+      alt.textContent = `${entryURLAlt(r)} (需泛域名证书)`;
+      tdEntry.appendChild(alt);
+    }
     tr.appendChild(tdEntry);
 
     const tdStat = document.createElement('td');
