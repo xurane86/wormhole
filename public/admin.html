@@ -88,12 +88,7 @@ function fmtBytes(n) {
 }
 
 function entryURL(r) {
-  // 路径模式永远可用，作为主入口展示
-  return `${location.origin}/p/${r.name}/`;
-}
-
-// 子域名模式入口（需要 *.域名 的泛域名证书，否则 HTTPS 不可用）
-function entryURLAlt(r) {
+  // 路径模式已移除，入口固定为子域名模式
   return ROOT ? `http://${r.name}.${ROOT}/` : '';
 }
 
@@ -103,8 +98,8 @@ async function load() {
   rules = data.rules;
   ROOT = data.rootDomain || '';
   const mode = ROOT
-    ? `path: ${location.origin}/p/{rule}/  ·  subdomain: {rule}.${ROOT}`
-    : `path: ${location.origin}/p/{rule}/`;
+    ? `subdomain: {rule}.${ROOT}`
+    : '未启用子域名模式（启动参数需加 --root-domain）';
   $('#modeHint').textContent = mode;
   $('#modeHint2').textContent = mode;
   render();
@@ -158,21 +153,19 @@ function render() {
     tr.appendChild(tdOnline);
 
     const tdEntry = document.createElement('td');
-    const a = document.createElement('a');
-    a.href = entryURL(r);
-    a.target = '_blank';
-    a.style.fontSize = '12px';
-    a.textContent = entryURL(r);
-    tdEntry.appendChild(a);
     if (ROOT) {
-      const alt = document.createElement('a');
-      alt.href = entryURLAlt(r);
-      alt.target = '_blank';
-      alt.style.display = 'block';
-      alt.style.fontSize = '12px';
-      alt.style.opacity = '0.65';
-      alt.textContent = `${entryURLAlt(r)} (需泛域名证书)`;
-      tdEntry.appendChild(alt);
+      const a = document.createElement('a');
+      a.href = entryURL(r);
+      a.target = '_blank';
+      a.style.fontSize = '12px';
+      a.textContent = entryURL(r);
+      tdEntry.appendChild(a);
+    } else {
+      const span = document.createElement('span');
+      span.className = 'muted';
+      span.style.fontSize = '12px';
+      span.textContent = '未配置子域名';
+      tdEntry.appendChild(span);
     }
     tr.appendChild(tdEntry);
 

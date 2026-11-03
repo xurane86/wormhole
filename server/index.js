@@ -7,12 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
 import { RuleStore } from './store.js';
 import { AgentHub } from './hub.js';
-import {
-  rewriteHtmlStream,
-  rewriteCssStream,
-  rewriteResponseHeaders,
-  canRewriteText,
-} from './rewrite.js';
+import { rewriteResponseHeaders } from './rewrite.js';
 import { sanitizeCloseCode, sanitizeCloseReason } from '../shared/protocol.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -101,14 +96,9 @@ const server = http.createServer(async (req, res) => {
     return sendJSON(res, 200, { token: store.get(name).token || expectedToken(name) });
   }
 
-  // 路径模式转发: /p/{name}/...
+  // 路由：仅子域名模式 {name}.root（路径模式已移除）
   let ruleName = null, innerPath = '/';
-  const m = pathName.match(/^\/p\/([a-z0-9][a-z0-9-]{1,62})(\/.*)?$/i);
-  if (m) {
-    ruleName = m[1];
-    innerPath = m[2] || '/';
-  } else if (ROOT_DOMAIN) {
-    // 子域名模式: {name}.root
+  if (ROOT_DOMAIN) {
     const host = (req.headers.host || '').split(':')[0].toLowerCase();
     if (host !== SELF_HOST && host !== ROOT_DOMAIN && host.endsWith('.' + ROOT_DOMAIN)) {
       ruleName = host.slice(0, -(ROOT_DOMAIN.length + 1));
@@ -116,10 +106,10 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  // 兜底模式：既非路径模式也非子域名模式时，完整原始 path + query 转发到默认规则
+  // 兜底模式：子域名模式未匹配时，完整原始 path + query 转发到默认规则
   // 必须独立判断：不能挂在上面 ROOT_DOMAIN 的 else 分支上，否则启用子域名模式后兜底永远不生效
   // 根路径上的 Service Worker 绝不能经兜底转发：它的 scope 是整个 relay 域名，
-  // 会接管 /admin 和其它规则，并把旧壳子缓存住。子域名模式/路径模式下各自天然隔离，不受影响。
+  // 会接管 /admin 和其它规则，并把旧壳子缓存住。子域名模式下天然隔离，不受影响。
   const rootServiceWorker = pathName === "/sw.js" || pathName === "/service-worker.js";
   if (!ruleName && DEFAULT_RULE && !rootServiceWorker && !isReservedPath(pathName)) {
     ruleName = DEFAULT_RULE;
@@ -127,8 +117,8 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (ruleName) {
-    // m 命中 = 路径模式（/p/{name}/...）；子域名/兑底模式在根路径上，不需要改写
-    return handleForward(req, res, ruleName, innerPath + url.search, Boolean(m));
+    // 子域名/兜底模式都在根路径上，无需改写
+    return handleForward(req, res, ruleName, innerPath + url.search);
   }
 
   // 根路径 → 简介页
@@ -138,7 +128,6 @@ const server = http.createServer(async (req, res) => {
 <body style="font-family:system-ui;max-width:640px;margin:60px auto">
 <h2>wormhole 运行中</h2>
 <p>通用内网反向代理 relay。访问 <a href="/admin">/admin</a> 管理路由规则。</p>
-<p>路径转发格式：<code>http://本机:${PORT}/p/{规则名}/路径</code></p>
 ${ROOT_DOMAIN ? `<p>子域名模式已启用：{规则名}.${ROOT_DOMAIN}</p>` : ''}
 </body>`);
   }
@@ -223,7 +212,7 @@ function readBody(req, limit = 64 * 1024 * 1024) {
 }
 
 // ---------- 转发 ----------
-async function handleForward(req, res, ruleName, innerPath, pathMode = true) {
+async function handleForward(req, res, ruleName, innerPath) {
   const rule = store.get(ruleName);
   if (!rule) {
     res.writeHead(404, { 'Content-Type': 'text/html; charset=utf-8' });
@@ -265,27 +254,10 @@ async function handleForward(req, res, ruleName, innerPath, pathMode = true) {
   try {
     const head = await fwd.response;
 
-    // 路径模式：Location / Set-Cookie 的 Path / HTML 绝对路径 / CSS url() 全部改写；
-    // 子域名模式：只去 hop-by-hop / content-length，body 与 header 原样。
-    // 注意：目标应用自身 JS 发起的绝对路径请求（如 fetch("/api/x")）无法在 relay 层改写，
-    // SPA 需应用侧配置 basePath（如 Next.js 的 basePath: '/p/{name}'）才能在路径模式完全可用。
-    const prefix = `/p/${ruleName}`;
-    const outHeaders = rewriteResponseHeaders(head.headers, {
-      prefix,
-      targetOrigin: head.targetOrigin,
-      pathMode,
-    });
-    const contentType = String(outHeaders['content-type'] || '');
-    const needHtmlRewrite = pathMode && /text\/html/i.test(contentType) && canRewriteText(contentType);
-    const needCssRewrite = pathMode && /text\/css/i.test(contentType) && canRewriteText(contentType);
+    // 子域名模式：只去掉 hop-by-hop / content-length，body 与 header 原样透传。
+    const outHeaders = rewriteResponseHeaders(head.headers);
     res.writeHead(head.status, outHeaders);
-    if (needHtmlRewrite) {
-      for await (const chunk of rewriteHtmlStream(head.body, prefix, head.targetOrigin)) res.write(chunk);
-    } else if (needCssRewrite) {
-      for await (const chunk of rewriteCssStream(head.body, prefix, head.targetOrigin)) res.write(chunk);
-    } else {
-      for await (const chunk of head.body) res.write(chunk);
-    }
+    for await (const chunk of head.body) res.write(chunk);
     res.end();
     store.bumpStats(ruleName, fwd.stats.bytesIn, fwd.stats.bytesOut);
   } catch (e) {
@@ -343,10 +315,8 @@ function attachKeepalive(ws) {
   return () => clearInterval(timer);
 }
 
-// WS 规则解析：与 HTTP 路由同一套逻辑（路径模式 → 子域名模式 → 兑底）
+// WS 规则解析：与 HTTP 路由同一套逻辑（子域名模式 → 兜底）
 function resolveWsRule(req, url) {
-  const m = url.pathname.match(/^\/p\/([a-z0-9][a-z0-9-]{1,62})(\/.*)?$/i);
-  if (m) return { name: m[1], innerPath: (m[2] || '/') + url.search };
   const host = (req.headers.host || '').split(':')[0].toLowerCase();
   if (ROOT_DOMAIN && host !== SELF_HOST
     && host.toLowerCase() !== ROOT_DOMAIN.toLowerCase()
@@ -487,7 +457,6 @@ setInterval(() => store.flush(), 60000).unref();
 server.listen(PORT, () => {
   console.log(`wormhole server 启动: http://0.0.0.0:${PORT}`);
   console.log(`  管理页:  http://0.0.0.0:${PORT}/admin`);
-  console.log(`  转发路径: /p/{规则名}/...`);
   if (ROOT_DOMAIN) console.log(`  子域名模式: {规则名}.${ROOT_DOMAIN}`);
   if (DEFAULT_RULE) {
     console.log(`  默认规则: ${DEFAULT_RULE}（未匹配的根路径请求将转发到该规则）`);
