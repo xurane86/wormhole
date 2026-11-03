@@ -4,10 +4,12 @@
 
 ```
 用户/浏览器 ──▶ relay（公网或外侧机器）
-                 │  按「路由规则」转发
+                 │  按「子域名」路由规则转发
                  │  WebSocket 长连接（agent 主动连入，内网无需公网IP/端口）
               agent（内网）──▶ http://内网目标:端口（任意网站，不改代码）
 ```
+
+**接入方式：仅支持子域名模式。** relay 依据请求的 `Host` 头，把 `{规则名}.<根域名>` 分流到对应 agent。应用始终运行在自己的 origin 根路径上，所以不需要改代码、不需要配 `basePath`，`/_next/*`、`/api/*`、Service Worker 的 scope 全都天然正确。
 
 ## 组成
 
@@ -23,51 +25,60 @@
 cd wormhole
 npm install
 
-# 1. 启动 relay（公网机器，或本机测试）
-node server/index.js --port 7800 --secret my-shared-secret
+# 1. 启动 relay（公网机器），开启子域名模式
+node server/index.js --port 7800 --secret my-shared-secret \
+  --root-domain example.com \
+  --self-host relay.example.com
 
 # 2. 启动 agent（内网机器），注册一条路由
-node agent/index.js --relay http://relay机器:7800 \
+node agent/index.js --relay http://relay.example.com:7800 \
   --secret my-shared-secret \
   --name intranet-wiki \
   --target http://192.168.1.10:8090
 
 # 3. 打开管理页启用规则
-#    http://relay机器:7800/admin
+#    http://relay.example.com:7800/admin
 ```
 
-之后外部访问 `http://relay机器:7800/p/intranet-wiki/` 即等于访问内网 `http://192.168.1.10:8090/`。
+之后外部访问 `http://intranet-wiki.example.com/` 即等于访问内网 `http://192.168.1.10:8090/`。
 
-## 接入任意网站的方式
+## 子域名模式
 
-### 方式一：路径模式（默认，改 BaseURL 即可）
+relay 侧需要两个参数：
 
-规则路径前缀为 `/p/{name}/`。目标网站若支持配置 BaseURL / 根路径（大多数 Wiki、文档站、内部系统都支持），把它设为 `http://relay:7800/p/{name}/` 即完成接入。
+| 参数 | 环境变量 | 说明 |
+|---|---|---|
+| `--root-domain` | — | 根域名，如 `example.com`；开启后 `{规则名}.example.com` 交给规则 |
+| `--self-host` | `RELAY_SELF_HOST` | relay 自身域名（如 `relay.example.com`），不会被当成规则名 |
 
-agent 会在转发时自动改写 HTML 里的绝对路径引用（`href="/..."`、`src="/..."`），帮助无 BaseURL 配置的简单站点尽量正常工作。
+DNS 侧：给根域名加一条泛解析 `*.example.com` → relay 的 IP。
 
-### 方式二：子域名模式（完全不改动感）
+请求进来后的判定顺序：
 
-`--host-mode`：设置 DNS 泛解析 `*.relay.你的域名.com` 指向 relay，访问 `{name}.relay.你的域名.com` 即直达内网站点，页面完全不需要路径前缀，兼容性最好。需在 relay 侧加 `--root-domain` 参数开启。
+1. Host 命中 `{规则名}.{root-domain}` → 转发给同名规则
+2. Host 等于 `--self-host` 或根域名本身 → relay 自身路由（`/`、`/admin`、`/api/*` 等）
+3. 其余 → 若配置了 `--default-rule` 走兜底，否则 404
 
-### 兑底模式：`--default-rule`（可选，单应用部署才建议开启）
+> **为什么没有路径模式**：把应用挂在 `/p/{name}/` 前缀下，只能通过改写 HTML 里的绝对路径来兜底。但 SPA 的请求由 JS 运行时发起（Next.js 的 `/_next/*` 与 RSC 请求、`fetch("/api/x")`、`new WebSocket(origin + "/ws")`），Service Worker 的 scope 也天然是根路径 —— 这些 relay 都无法改写。子域名模式下应用根路径不变，因此兼容性最好，也是目前唯一支持的接入方式。
+
+## 兜底模式：`--default-rule`（可选，单应用部署才建议开启）
 
 ```bash
 node server/index.js --port 7800 --secret ... --default-rule intranet-wiki
 # 或环境变量 RELAY_DEFAULT_RULE=intranet-wiki
 ```
 
-开启后，所有既不是路径模式（`/p/{name}/...`）、也不是子域名模式的请求（含 WebSocket upgrade），都会把完整原始 path + query 转发到指定规则。适合「一台 relay 只服务一个内网应用」的部署，应用无需任何路径前缀即可完整可用。
+开启后，所有**未被子域名模式匹配**的请求（含 WebSocket upgrade）都会把完整原始 path + query 转发到指定规则。适合「一台 relay 只服务一个内网应用」的部署，应用无需任何域名前缀即可完整可用。
 
-**安全提示：这本质是“单应用兑底”，一旦开启，任何扫到你域名的未匹配路径（如 `/wp-admin`、`/.env`）都会被转发进内网应用，仅建议在内网或带认证的前置层之后使用。**
+**安全提示：这本质是“单应用兜底”，一旦开启，任何扫到你域名的未匹配路径（如 `/wp-admin`、`/.env`）都会被转发进内网应用，仅建议在内网或带认证的前置层之后使用。**
 
-以下 relay 自身路由优先于兑底，不会被转发：`/`、`/admin`、`/admin/*`、`/style.css`、`/api/rules`、`/api/rules/*`、`/api/agent-token/*`、`/agent/ws`。指向的规则不存在时仅打启动警告，可在 `/admin` 中创建后自动生效。
+以下 relay 自身路由优先于兜底，不会被转发：`/`、`/admin`、`/admin/*`、`/style.css`、`/api/rules`、`/api/rules/*`、`/api/agent-token/*`、`/agent/ws`。指向的规则不存在时仅打启动警告，可在 `/admin` 中创建后自动生效。
 
 ## 支持的流量
 
 - 普通 HTTP/HTTPS 请求（GET/POST/PUT/DELETE/PATCH，含二进制与流式响应）
-- WebSocket 透传：浏览器到内网目标的应用层 WebSocket 连接会在 relay 上自动桥接（含路径模式 `/p/{name}/ws/...`、子域名模式与下述 `--default-rule` 兑底模式）。文本/二进制帧原样透传，客户端请求的子协议由目标选中的协议回显；规则不存在返回 404、规则停用返回 502、agent 离线返回 503。注意：JS 发起的 `fetch("/api/...")` 等绝对路径请求在路径模式下仍无法由 relay 改写，SPA 类应用建议配置应用自身 basePath
-- 请求/响应头按需透传，自动处理 `Host`、`X-Forwarded-*`
+- WebSocket 透传：浏览器到内网目标的应用层 WebSocket 连接会在 relay 上自动桥接（子域名模式与 `--default-rule` 兜底模式）。文本/二进制帧原样透传，客户端请求的子协议由目标选中的协议回显；规则不存在返回 404、规则停用返回 502、agent 离线返回 503
+- 请求/响应头按需透传（自动去掉 hop-by-hop 头），自动处理 `Host`、`X-Forwarded-*`
 
 ### WebSocket 保活与心跳
 
@@ -81,16 +92,13 @@ node server/index.js --port 7800 --secret ... --default-rule intranet-wiki
 
 1. **前置代理的空闲超时**：浏览器 → Cloudflare/nginx → relay 这条链路上，WS 空闲会被中间层掐断。relay 已内置 30s 保活 Ping；若仍偶发，检查反向代理的 `proxy_read_timeout`/`proxy_send_timeout` 是否小于 30s。
 2. **目标站自己的心跳**：确认 agent 侧日志没有 `与 relay 断开`，同时目标站日志里没有 `no pong`/心跳超时。agent 会回 Pong，若目标站用的是应用层心跳（JSON 消息而非 WS 控制帧），relay 只做透传，需要目标站自身正确应答。
-3. **agent 是否在反复重连**：relay 控制台会打印 `[agent] "xxx" 已连接 / 已断开`。若频繁出现，说明 relay 与 agent 之间的链路不稳（网络/前置代理），此时浏览器侧的所有 WS 都会跟着断。
-4. **路径模式下的应用**：若应用前端用绝对路径（Next.js 的 `/_next/...`、`/api/...`、`ws://host/ws` 等），路径模式本身就无法工作，见下节。
+3. **agent 是否在反复重连**：relay 控制台会打印 `[agent] "xxx" 已连接 / 已断开`。若频繁出现，说明 relay 与 agent 之间的链路不稳（网络/前置代理），此时浏览器侧的所有 WS 都会跟着断。注意 agent 每 30s 发一次 Ping，10s 内收不到 Pong 就会主动重连；如果 agent 经过 Cloudflare 等终结型 WS 代理，控制帧可能不透传，建议让 agent 直连 relay 源站地址。
 
-## 路径模式能接什么、不能接什么
+## 反向代理 / CDN 注意事项
 
-路径模式（`/p/{name}/`）只在「应用自身支持配置 BaseURL/basePath」时才完整可用：
-
-- 能接：支持 BaseURL 的 Wiki、文档站、后台系统；纯静态站（relay 会注入 `<base>` 并改写 HTML/CSS 里的绝对路径）。
-- 接不了：前端硬编码绝对路径的 SPA（Next.js 的 `/_next/*` 与 RSC 请求、`fetch("/api/x")`、`new WebSocket(origin + "/ws")`）。这些请求由 JS 运行时发起，relay 改不到，会直接打到 relay 根路径上（404 或落到别的规则）。
-- 这类应用用**子域名模式**，或给应用配 basePath；单应用部署也可以用 `--default-rule` 兑底。
+- 反代要把 `Host` 原样透传给 relay，否则子域名规则无法匹配。
+- 若在 relay 前面开了**静态资源缓存**（如 Nginx Proxy Manager 的 Asset Caching），注意它通常会连同 5xx 响应一起缓存。relay 抖动时产生的 502/503 会被缓存住，表现为“某个 `.js` 一直 502”。建议对 relay 关闭静态资源缓存。
+- WebSocket 需要反代支持 Upgrade 透传。
 
 ## 测试
 
@@ -98,8 +106,7 @@ node server/index.js --port 7800 --secret ... --default-rule intranet-wiki
 npm test        # test/e2e.mjs：同进程拉起 relay + agent + 模拟目标站
 ```
 
-覆盖路径/子域名两种模式的 HTTP 与 WS 转发、目标侧心跳（Ping→Pong）、WS 子协议协商、relay 侧保活。
-
+覆盖子域名模式的 HTTP 与 WS 转发、目标侧心跳（Ping→Pong）、WS 子协议协商、relay 侧保活。
 
 ## 管理页面
 
@@ -108,6 +115,7 @@ npm test        # test/e2e.mjs：同进程拉起 relay + agent + 模拟目标站
 - 查看/新增/编辑/删除路由规则
 - 启用/停用单条规则（停用后 relay 返回 502 提示页）
 - 实时显示每条规则的连接 agent 与流量统计
+- 入口地址列显示子域名访问地址（`{规则名}.<根域名>`）
 
 ## 安全建议
 
